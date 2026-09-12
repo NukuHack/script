@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""
+Cross-platform macro: repeatedly click a mouse button or press a key,
+toggled on/off with Caps Lock. Works on Linux (X11 & Wayland), macOS, Windows.
+
+Usage: ./macro.py <target> [interval|h]
+  Target: l/left, r/right, m/middle, or any key name (d, space, up, ...)
+  Time:   <seconds> for repeat, or 'h' to hold continuously.
+"""
+import sys
+import time
+import threading
+from pynput import keyboard, mouse
+
+# ---- parse args ----
+if len(sys.argv) < 2:
+    print(__doc__)
+    sys.exit(1)
+
+target = sys.argv[1].lower()
+interval = sys.argv[2] if len(sys.argv) > 2 else "1"
+hold_mode = interval in ("h", "hold")
+if not hold_mode:
+    try:
+        interval = float(interval)
+    except ValueError:
+        print(f"Invalid interval: {interval}")
+        sys.exit(1)
+
+# ---- figure out target type ----
+MOUSE = {"l": mouse.Button.left, "left": mouse.Button.left,
+         "r": mouse.Button.right, "right": mouse.Button.right,
+         "m": mouse.Button.middle, "middle": mouse.Button.middle}
+
+is_mouse = target in MOUSE
+mouse_btn = MOUSE.get(target)
+
+# for keys we strip an optional "key:" prefix
+key_name = target[4:] if target.startswith("key:") else target
+Key = keyboard.Key
+special_keys = {
+    "space": Key.space, "enter": Key.enter, "return": Key.enter,
+    "tab": Key.tab, "esc": Key.esc, "escape": Key.esc,
+    "up": Key.up, "down": Key.down, "left_arrow": Key.left,
+    "right_arrow": Key.right, "shift": Key.shift, "ctrl": Key.ctrl,
+    "alt": Key.alt, "backspace": Key.backspace,
+}
+key_obj = special_keys.get(key_name, key_name if not is_mouse else None)
+
+kbd = keyboard.Controller()
+ms = mouse.Controller()
+
+running = False   # toggled by caps lock
+stop = threading.Event()
+
+def do_action():
+    if is_mouse:
+        if hold_mode:
+            ms.press(mouse_btn)
+        else:
+            ms.click(mouse_btn)
+    else:
+        if hold_mode:
+            kbd.press(key_obj)
+        else:
+            kbd.press(key_obj)
+            kbd.release(key_obj)
+
+def release_action():
+    if not hold_mode:
+        return
+    if is_mouse:
+        ms.release(mouse_btn)
+    else:
+        kbd.release(key_obj)
+
+# ---- caps lock detection ----
+# On Linux, pynput gives us the lock state via the listener; on macOS/Windows
+# we can read it too. We watch for the toggle event.
+caps_on = False
+
+def on_press(key):
+    global caps_on, running
+    if key == Key.caps_lock:
+        caps_on = not caps_on
+        running = caps_on
+        if running:
+            print(time.strftime("%H:%M:%S"), "- ▶️  RUNNING")
+            do_action()
+        else:
+            print(time.strftime("%H:%M:%S"), "- ⏸️  PAUSED")
+            release_action()
+
+# ---- main loop ----
+def worker():
+    while not stop.is_set():
+        if running and not hold_mode:
+            do_action()
+        if hold_mode:
+            time.sleep(0.05)
+        else:
+            # sleep in small chunks so Ctrl+C and toggles feel responsive
+            end = time.time() + interval
+            while time.time() < end and not stop.is_set():
+                time.sleep(0.02)
+
+listener = keyboard.Listener(on_press=on_press)
+listener.start()
+
+print(f"{'Holding' if hold_mode else 'Repeating'} {target}"
+      f"{'' if hold_mode else f' every {interval}s'}.")
+print("Toggle Caps Lock to pause/resume. Ctrl+C to stop.")
+
+t = threading.Thread(target=worker, daemon=True)
+t.start()
+
+try:
+    while True:
+        time.sleep(0.2)
+except KeyboardInterrupt:
+    pass
+finally:
+    stop.set()
+    if running:
+        release_action()
+    listener.stop()
+    print("\nMacro stopped.")

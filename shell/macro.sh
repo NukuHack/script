@@ -1,0 +1,212 @@
+#!/bin/bash
+#
+# Unified macro script: clicks a mouse button OR presses a key, repeatedly
+# or held down, paused/resumed with Caps Lock.
+#
+# Usage: ./macro.sh <target> [sleep_time|h]
+#
+# Target:
+#   l, left, r, right, m, middle   -> mouse click
+#   any other value                -> keyboard key (e.g. d, space, w, Up)
+#
+# Time:
+#   <number>  - repeat every N seconds (e.g. 0.5, 1, 2)
+#   h         - HOLD down continuously
+#
+# Toggle Caps Lock to PAUSE/RESUME. Press Ctrl+C to stop.
+
+if [ $# -eq 0 ]; then
+    echo "Usage: $0 <target> [sleep_time|h]"
+    echo ""
+    echo "Target:"
+    echo "  l / left    - Left click"
+    echo "  r / right   - Right click"
+    echo "  m / middle  - Middle click"
+    echo "  <key>       - Any keyboard key (e.g. d, space, w, Up)"
+    echo "  key:<letter> - Force key mode for letters that collide with"
+    echo "                 mouse shortcuts (e.g. key:r, key:l, key:m)"
+    echo ""
+    echo "Time Options:"
+    echo "  <number>  - Repeat every N seconds (e.g. 0.5, 1, 2)"
+    echo "  h         - HOLD down continuously"
+    echo ""
+    echo "Toggle Caps Lock to PAUSE/RESUME the macro"
+    echo "Press Ctrl+C to completely stop"
+    exit 1
+fi
+
+target_input=$1
+sleep_time=${2:-1}
+hold_mode=false
+
+if [ "$sleep_time" = "h" ] || [ "$sleep_time" = "hold" ]; then
+    hold_mode=true
+    sleep_time=1  # fallback value, unused in hold mode
+fi
+
+# Decide whether target is a mouse button or a keyboard key
+mode="key"
+button=""
+button_name=""
+key_formatted=""
+
+case "$target_input" in
+    key:*)
+        mode="key"
+        target_input="${target_input#key:}"
+        key_lower=$(echo "$target_input" | tr '[:upper:]' '[:lower:]')
+        case $key_lower in
+            up|down|left_arrow|right_arrow)
+                key_formatted="$(echo ${key_lower:0:1} | tr '[:lower:]' '[:upper:]')${key_lower:1}"
+                ;;
+            *)
+                key_formatted="$key_lower"
+                ;;
+        esac
+        ;;
+    l|left)
+        mode="mouse"; button=1; button_name="Left"
+        ;;
+    r|right)
+        mode="mouse"; button=3; button_name="Right"
+        ;;
+    m|middle)
+        mode="mouse"; button=2; button_name="Middle"
+        ;;
+    *)
+        mode="key"
+        key_lower=$(echo "$target_input" | tr '[:upper:]' '[:lower:]')
+        case $key_lower in
+            up|down|left_arrow|right_arrow)
+                key_formatted="$(echo ${key_lower:0:1} | tr '[:lower:]' '[:upper:]')${key_lower:1}"
+                ;;
+            *)
+                key_formatted="$key_lower"
+                ;;
+        esac
+        ;;
+esac
+
+# Get the Caps Lock LED path (works for both modes)
+caps_led=""
+for led in /sys/class/leds/input*::capslock/brightness; do
+    if [ -f "$led" ]; then
+        caps_led="$led"
+        break
+    fi
+done
+
+# Setup trap for clean exit
+cleanup() {
+    echo ""
+    if [ "$hold_mode" = true ] && [ "$paused" = false ]; then
+        if [ "$mode" = "mouse" ]; then
+            xdotool mouseup "$button"
+            echo "Released $button_name button"
+        else
+            xdotool keyup "$key_formatted" 2>/dev/null
+            echo "Released '$key_formatted' key"
+        fi
+    fi
+    echo "Macro stopped."
+    exit 0
+}
+trap cleanup INT TERM
+
+# Perform / release the action, mode-aware
+perform_action() {
+    if [ "$mode" = "mouse" ]; then
+        if [ "$hold_mode" = true ]; then
+            xdotool mousedown "$button"
+        else
+            xdotool click "$button"
+        fi
+    else
+        if [ "$hold_mode" = true ]; then
+            xdotool keydown "$key_formatted"
+        else
+            xdotool key "$key_formatted"
+        fi
+    fi
+}
+
+release_action() {
+    if [ "$hold_mode" = true ]; then
+        if [ "$mode" = "mouse" ]; then
+            xdotool mouseup "$button"
+        else
+            xdotool keyup "$key_formatted"
+        fi
+    fi
+}
+
+if [ "$mode" = "mouse" ]; then
+    if [ "$hold_mode" = true ]; then
+        echo "HOLDING '$button_name' button down..."
+    else
+        echo "Clicking '$button_name' button every ${sleep_time} second(s)..."
+    fi
+else
+    if [ "$hold_mode" = true ]; then
+        echo "Holding '$key_formatted' key..."
+    else
+        echo "Pressing '$key_formatted' every ${sleep_time} second(s)..."
+    fi
+fi
+echo "----------------------------------------"
+echo "CAPS LOCK ON  = Macro RUNNING ▶️"
+echo "CAPS LOCK OFF = Macro PAUSED ⏸️"
+echo "Press Ctrl+C to completely stop"
+echo "----------------------------------------"
+
+paused=true
+
+run_loop() {
+    local use_led=$1  # true/false
+    local prev_state=$2
+
+    while true; do
+        if [ "$use_led" = true ]; then
+            caps_state=$(cat "$caps_led" 2>/dev/null || echo "0")
+            on_value="1"
+        else
+            if command -v xset >/dev/null 2>&1; then
+                caps_state=$(xset q 2>/dev/null | grep "Caps Lock:" | awk '{print $4}')
+            else
+                caps_state="off"
+            fi
+            on_value="on"
+        fi
+
+        if [ "$caps_state" != "$prev_state" ]; then
+            prev_state="$caps_state"
+            if [ "$caps_state" = "$on_value" ]; then
+                echo "$(date '+%H:%M:%S') - ▶️  RESUMED - Macro RUNNING"
+                paused=false
+                perform_action
+            else
+                echo "$(date '+%H:%M:%S') - ⏸️  PAUSED - Macro PAUSED"
+                paused=true
+                release_action
+            fi
+        fi
+
+        if [ "$paused" = false ] && [ "$hold_mode" = false ]; then
+            perform_action
+        fi
+
+        if [ "$hold_mode" = false ]; then
+            sleep "$sleep_time"
+        else
+            sleep 0.1
+        fi
+    done
+}
+
+if [ -z "$caps_led" ]; then
+    echo "Warning: Cannot find Caps Lock LED. Using fallback method (polling xset)..."
+    run_loop false "off"
+else
+    echo "$(date '+%H:%M:%S') - ⏸️  PAUSED - Press Caps Lock to start"
+    run_loop true "$(cat "$caps_led")"
+fi

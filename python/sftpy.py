@@ -1,0 +1,771 @@
+#!/usr/bin/env python2.7
+from __future__ import print_function
+import os
+import sys
+import pty
+import subprocess
+import select
+import tty
+import termios
+import signal
+import fcntl
+import getpass
+import re
+import time
+
+# Runs under either Python 2.7 or Python 3. os.read()/os.write() deal in
+# raw bytes on both, but under Python 3 that's a distinct `bytes` type
+# (indexing it gives ints, not characters), whereas under Python 2 `str`
+# already IS bytes. Decode once at the door, encode once on the way out,
+# and the rest of the code can just work with plain text throughout.
+PY2 = sys.version_info[0] == 2
+
+
+def to_text(data):
+    """Bytes fresh off the wire -> text for our line-editing logic."""
+    if PY2:
+        return data
+    if isinstance(data, bytes):
+        return data.decode('utf-8', 'replace')
+    return data
+
+
+def to_wire(text):
+    """Text -> whatever os.write()/the pty expects on this interpreter."""
+    if PY2:
+        return text
+    if isinstance(text, str):
+        return text.encode('utf-8', 'replace')
+    return text
+
+
+def which(program):
+    """Locate an executable on PATH, without relying on shutil.which
+    (shutil.which doesn't exist in Python 2.7)."""
+    def is_exe(path):
+        return os.path.isfile(path) and os.access(path, os.X_OK)
+
+    fpath, _ = os.path.split(program)
+    if fpath:
+        return program if is_exe(program) else None
+
+    for path in os.environ.get('PATH', '').split(os.pathsep):
+        exe_file = os.path.join(path.strip('"'), program)
+        if is_exe(exe_file):
+            return exe_file
+    return None
+
+
+def _new_session_with_ctty():
+    """preexec_fn for the sftp/ssh child: start a new session and make
+    fd 0 (already redirected to the pty slave by the time preexec_fn
+    runs) the controlling terminal. Without this, ssh has no controlling
+    tty to open /dev/tty on, decides it can't prompt directly, and falls
+    back to SSH_ASKPASS - which then fails if no askpass helper exists."""
+    os.setsid()
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+
+def _take_foreground_pgrp():
+    """preexec_fn for locally-run shell commands (bash -i -c ...). An
+    interactive bash grabs the terminal's foreground process group for
+    itself; if we don't hand it over cleanly, our own python process can
+    get SIGTTIN'd (and stopped by the shell) the next time it reads from
+    the terminal after the child exits."""
+    os.setpgrp()
+    os.tcsetpgrp(0, os.getpgrp())
+
+
+class CustomSFTP:
+    def __init__(self):
+        self.master_fd = None
+        self.slave_fd = None
+        self.process = None
+        self.connected = False
+        self.old_settings = None
+        self.old_stdin_flags = None
+        self.password_sent = False
+        self.input_buffer = ''
+        self.current_line = ''
+        self.in_local_command = False
+        self.local_process = None
+        # Command history (poor-man's readline, arrow-key driven)
+        self.history = []
+        self.history_pos = None
+        self.saved_line = ''
+        # Until the real "sftp>" prompt shows up, we're still in the ssh
+        # login phase (password prompt, host-key confirmation, banners...).
+        # Keystrokes there must go straight to the pty untouched - they are
+        # NOT sftp/local commands, and treating them as such is exactly
+        # what made a typed password get run as a bash command.
+        self.interactive = False
+        self._prompt_scan_buf = ''
+        
+    def connect(self, target, port=22):
+        """Establish SFTP connection using system sftp with pty"""
+        try:
+            # Check if sshpass is available
+            if which('sshpass'):
+                return self.connect_with_sshpass(target, port)
+            
+            # For sftp, use -P for port
+            cmd = ['sftp']
+            if port != 22:
+                cmd.extend(['-P', str(port)])
+            
+            # Force password authentication and disable askpass
+            cmd.extend([
+                '-o', 'PreferredAuthentications=password',
+                '-o', 'PubkeyAuthentication=no',
+                '-o', 'BatchMode=no',
+                '-o', 'StrictHostKeyChecking=no',
+                '-o', 'UserKnownHostsFile=/dev/null',
+                '-o', 'NumberOfPasswordPrompts=1'
+            ])
+            
+            # Set environment variables so ssh can't fall back to a GUI
+            # askpass helper - remove the keys entirely rather than set
+            # them to '', since an empty-but-present SSH_ASKPASS is what
+            # ssh tries to exec() and fails on. With a real controlling
+            # terminal (see _new_session_with_ctty below) it shouldn't
+            # need askpass at all, but this keeps it from even trying.
+            env = os.environ.copy()
+            for key in ('SSH_ASKPASS', 'DISPLAY', 'SSH_AUTH_SOCK'):
+                env.pop(key, None)
+            env['SSH_ASKPASS_REQUIRE'] = 'never'
+            
+            cmd.append(target)
+            
+            # Create a pseudo-terminal
+            self.master_fd, self.slave_fd = pty.openpty()
+            
+            # Start sftp with the slave side of the pty
+            self.process = subprocess.Popen(
+                cmd,
+                stdin=self.slave_fd,
+                stdout=self.slave_fd,
+                stderr=self.slave_fd,
+                preexec_fn=_new_session_with_ctty,
+                close_fds=True,
+                env=env
+            )
+            
+            # Close the slave side in parent
+            os.close(self.slave_fd)
+            
+            self.connected = True
+            print("Connecting to {0}...".format(target))
+            
+            # Save current terminal settings
+            self.old_settings = termios.tcgetattr(sys.stdin.fileno())
+            
+            # Set non-blocking on master
+            fl = fcntl.fcntl(self.master_fd, fcntl.F_GETFL)
+            fcntl.fcntl(self.master_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+            
+            return True
+                
+        except Exception as e:
+            print("Connection failed: {0}".format(e))
+            return False
+    
+    def connect_with_sshpass(self, target, port=22):
+        """Connect using sshpass for password handling"""
+        try:
+            # Get password first
+            print("Connecting to {0}...".format(target))
+            sys.stdout.write("Password: ")
+            sys.stdout.flush()
+            
+            # Save current terminal settings and disable echo
+            self.old_settings = termios.tcgetattr(sys.stdin.fileno())
+            tty.setraw(sys.stdin.fileno())
+            
+            # Read password manually (character by character to hide it)
+            password = ''
+            while True:
+                char = sys.stdin.read(1)
+                if char == '\n' or char == '\r':
+                    break
+                elif char == '\x03':  # Ctrl+C
+                    raise KeyboardInterrupt
+                elif char == '\x7f' or char == '\x08':  # Backspace
+                    if password:
+                        password = password[:-1]
+                        sys.stdout.write('\b \b')
+                        sys.stdout.flush()
+                else:
+                    password += char
+                    sys.stdout.write('*')
+                    sys.stdout.flush()
+            
+            # Restore terminal settings
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSAFLUSH, self.old_settings)
+            sys.stdout.write('\n')
+            sys.stdout.flush()
+            
+            # Use sshpass with sftp
+            cmd = ['sshpass', '-p', password]
+            cmd.extend(['sftp'])
+            if port != 22:
+                cmd.extend(['-P', str(port)])
+            cmd.extend([
+                '-o', 'StrictHostKeyChecking=no',
+                '-o', 'UserKnownHostsFile=/dev/null'
+            ])
+            cmd.append(target)
+            
+            # Clear password from memory
+            del password
+            
+            # Start sftp with sshpass
+            self.master_fd, self.slave_fd = pty.openpty()
+            
+            self.process = subprocess.Popen(
+                cmd,
+                stdin=self.slave_fd,
+                stdout=self.slave_fd,
+                stderr=self.slave_fd,
+                preexec_fn=_new_session_with_ctty,
+                close_fds=True
+            )
+            
+            os.close(self.slave_fd)
+            
+            self.connected = True
+            
+            # Set non-blocking on master
+            fl = fcntl.fcntl(self.master_fd, fcntl.F_GETFL)
+            fcntl.fcntl(self.master_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+            
+            # Wait for connection to establish
+            time.sleep(1)
+            
+            # Read and discard initial connection output (banner, etc.)
+            self.read_output(2)
+            
+            # Check if connection was successful
+            if self.process.poll() is not None:
+                print("\nConnection failed")
+                return False
+            
+            print("\nConnected!")
+            sys.stdout.flush()
+            
+            # Wait a moment for sftp to settle
+            time.sleep(0.5)
+            
+            # Clear any remaining output
+            self.read_output(0.5)
+            
+            # Set raw mode for interactive session
+            tty.setraw(sys.stdin.fileno())
+            self.old_stdin_flags = fcntl.fcntl(sys.stdin.fileno(), fcntl.F_GETFL)
+            fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, self.old_stdin_flags | os.O_NONBLOCK)
+            
+            # Print help message with proper spacing
+            print("\nType 'help' for available commands\n")
+            sys.stdout.flush()
+            
+            # Send a newline to sftp to get a fresh prompt
+            os.write(self.master_fd, b'\n')
+            
+            return True
+            
+        except Exception as e:
+            print("\nConnection failed: {0}".format(e))
+            return False
+    
+    def read_output(self, timeout=0.5):
+        """Read available output from the master fd"""
+        output = b''
+        end_time = time.time() + timeout
+        
+        while time.time() < end_time:
+            try:
+                rlist, _, _ = select.select([self.master_fd], [], [], 0.1)
+                if self.master_fd in rlist:
+                    data = os.read(self.master_fd, 4096)
+                    if data:
+                        output += data
+                    else:
+                        break
+            except (OSError, IOError):
+                break
+        
+        return output
+    
+    def translate_command(self, command):
+        """Translate custom commands to sftp commands or local shell commands"""
+        # Remove leading/trailing whitespace
+        command = command.strip()
+        
+        # Split command and arguments
+        parts = command.split()
+        if not parts:
+            return None, None
+        
+        cmd = parts[0].lower()
+        args = parts[1:] if len(parts) > 1 else []
+        
+        # Remote commands (translated to sftp commands)
+        remote_translations = {
+            'rls': 'ls',
+            'rcd': 'cd',
+            'rpwd': 'pwd',
+            'rget': 'get',
+            'rput': 'put',
+        }
+        
+        # Session commands
+        if cmd in ['bye', 'exit', 'quit']:
+            return 'sftp', 'bye'
+        
+        # Help command
+        if cmd == 'help':
+            self.show_help()
+            return None, None
+        
+        # Remote commands
+        if cmd in remote_translations:
+            translated_cmd = remote_translations[cmd]
+            if args:
+                return 'sftp', "{0} {1}".format(translated_cmd, ' '.join(args))
+            return 'sftp', translated_cmd
+        
+        # Local commands - run in our shell
+        return 'local', command
+    
+    def run_local_command(self, command):
+        """Run a command in the local shell using the same bash environment"""
+        stdin_fd = sys.stdin.fileno()
+        try:
+            # Set flag to indicate we're in local command mode
+            self.in_local_command = True
+            
+            # Restore terminal to normal (cooked) mode
+            termios.tcsetattr(stdin_fd, termios.TCSAFLUSH, self.old_settings)
+
+            # IMPORTANT: stdin was set O_NONBLOCK for the sftp passthrough
+            # loop. That flag lives on the shared file description, so the
+            # child bash below would inherit it too and its interactive
+            # readline (needed for aliases/.bashrc) breaks on a nonblocking
+            # stdin. Clear it here and restore it once we're done.
+            if self.old_stdin_flags is not None:
+                fcntl.fcntl(stdin_fd, fcntl.F_SETFL, self.old_stdin_flags)
+            
+            # Run the command in interactive bash with the same environment
+            print()  # New line
+            
+            # Get the user's shell from environment
+            user_shell = os.environ.get('SHELL', '/bin/bash')
+            
+            # Run command in interactive mode to get all aliases and functions
+            # Use -i for interactive (loads .bashrc), -c for command
+            self.local_process = subprocess.Popen(
+                [user_shell, '-i', '-c', command],
+                stdin=sys.stdin,
+                stdout=sys.stdout,
+                stderr=sys.stderr,
+                preexec_fn=_take_foreground_pgrp
+            )
+            
+            # Wait for command to complete
+            self.local_process.wait()
+            
+            print()  # New line
+            
+        except Exception as e:
+            print("Error running command: {0}".format(e))
+        finally:
+            # Reclaim the terminal's foreground process group for
+            # ourselves. bash -i grabbed it (see _take_foreground_pgrp)
+            # and won't hand it back on its own; without this, our own
+            # next read from the terminal gets SIGTTIN'd and the whole
+            # script is stopped by the shell.
+            try:
+                os.tcsetpgrp(stdin_fd, os.getpgrp())
+            except OSError:
+                pass
+
+            # Always get back to raw + nonblocking for the sftp passthrough
+            # loop, no matter what happened above.
+            try:
+                tty.setraw(stdin_fd)
+            except Exception:
+                pass
+            try:
+                fl = fcntl.fcntl(stdin_fd, fcntl.F_GETFL)
+                fcntl.fcntl(stdin_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+            except Exception:
+                pass
+
+            self.in_local_command = False
+            self.local_process = None
+            self.input_buffer = ''
+
+            # Send a newline to sftp to get a fresh prompt
+            try:
+                os.write(self.master_fd, to_wire('\n'))
+            except (OSError, IOError):
+                pass
+    
+    def show_help(self):
+        """Show custom help message"""
+        stdin_fd = sys.stdin.fileno()
+        try:
+            # Restore terminal to normal mode for help display
+            termios.tcsetattr(stdin_fd, termios.TCSAFLUSH, self.old_settings)
+
+            help_text = """
+Remote Commands:
+  rls [path]       List remote directory
+  rcd [path]       Change remote directory
+  rpwd             Show remote working directory
+  get <file>       Download file from remote
+  put <file>       Upload file to remote
+
+Local Commands:
+  Any command      Runs in your local shell
+                   (python, ls, cd, mkdir, etc.)
+
+Session:
+  bye/exit/quit    Exit
+  help             Show this help
+"""
+            print(help_text)
+            sys.stdout.flush()
+        except Exception as e:
+            print("Error displaying help: {0}".format(e))
+        finally:
+            # Always get back to raw mode, even if something above failed
+            try:
+                tty.setraw(stdin_fd)
+            except Exception:
+                pass
+    
+    def handle_backspace(self):
+        """Handle backspace in input buffer"""
+        if self.input_buffer:
+            # Remove last character
+            self.input_buffer = self.input_buffer[:-1]
+            # Echo backspace to terminal
+            sys.stdout.write('\b \b')
+            sys.stdout.flush()
+
+    def clear_line_display(self):
+        """Erase what the user has typed so far on the current line
+        (leaves the sftp prompt itself untouched)."""
+        if self.input_buffer:
+            sys.stdout.write('\b \b' * len(self.input_buffer))
+            sys.stdout.flush()
+
+    def set_line(self, text):
+        """Replace the currently displayed/edited line with text (used
+        for history recall)."""
+        self.clear_line_display()
+        self.input_buffer = text
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+    def history_up(self):
+        """Recall the previous history entry (Up arrow)."""
+        if not self.history:
+            return
+        if self.history_pos is None:
+            self.saved_line = self.input_buffer
+            self.history_pos = len(self.history) - 1
+        elif self.history_pos > 0:
+            self.history_pos -= 1
+        else:
+            return
+        self.set_line(self.history[self.history_pos])
+
+    def history_down(self):
+        """Recall the next history entry (Down arrow)."""
+        if self.history_pos is None:
+            return
+        if self.history_pos < len(self.history) - 1:
+            self.history_pos += 1
+            self.set_line(self.history[self.history_pos])
+        else:
+            self.history_pos = None
+            self.set_line(self.saved_line)
+            self.saved_line = ''
+
+    def submit_current_line(self):
+        """Called when the user presses Enter. Translates/dispatches the
+        current line and records it in history."""
+        line = self.input_buffer
+        self.input_buffer = ''
+        self.history_pos = None
+        self.saved_line = ''
+
+        if not line.strip():
+            os.write(self.master_fd, to_wire('\n'))
+            return
+
+        # Record in history (skip immediate duplicates)
+        if not self.history or self.history[-1] != line:
+            self.history.append(line)
+
+        # NOTE: deliberately not wrapped in a blanket try/except that
+        # forwards the raw line to sftp on failure. That masked real
+        # problems (e.g. 'help' or local commands silently ending up sent
+        # to the remote sftp session). translate_command()/show_help() and
+        # run_local_command() are each responsible for handling their own
+        # errors; only the final write to the remote pty is guarded here.
+        command_type, translated = self.translate_command(line)
+
+        if command_type is None:
+            # Help command - already handled
+            try:
+                os.write(self.master_fd, to_wire('\n'))
+            except (OSError, IOError):
+                pass
+            return
+
+        if command_type == 'local':
+            # Clear the line first
+            sys.stdout.write('\r' + ' ' * 80 + '\r')
+            sys.stdout.flush()
+            # Run locally
+            self.run_local_command(line)
+            return
+
+        # Remote/sftp command
+        if translated:
+            # Clear the current line from display
+            sys.stdout.write('\r' + ' ' * 80 + '\r')
+            sys.stdout.flush()
+
+            # Send translated command to sftp (sftp will echo it)
+            try:
+                os.write(self.master_fd, to_wire(translated + '\n'))
+            except (OSError, IOError):
+                pass
+
+    def _check_prompt(self, output):
+        """Watch the remote's output for the real "sftp>" prompt to know
+        when the ssh login phase (password/host-key/banners) is over and
+        it's safe to start treating typed lines as sftp/local commands."""
+        text = to_text(output)
+        buf = self._prompt_scan_buf + text
+        if 'sftp>' in buf:
+            self.interactive = True
+            self._prompt_scan_buf = ''
+        else:
+            # Keep a small tail in case "sftp>" is split across two reads
+            self._prompt_scan_buf = buf[-16:]
+
+    def process_input(self, data):
+        """Process raw bytes read from stdin: local line-editing
+        (backspace, arrow-key history) plus dispatch on Enter.
+
+        Written for Python 2.7, where a `str`/byte string indexes/iterates
+        as single-character strings rather than ints."""
+        if self.in_local_command:
+            return
+
+        data = to_text(data)
+
+        if not self.interactive:
+            # Still in the ssh login phase: relay keystrokes straight to
+            # the pty. Don't echo locally - the pty/ssh itself decides
+            # whether to show what's typed (e.g. it won't for a password).
+            try:
+                os.write(self.master_fd, to_wire(data))
+            except (OSError, IOError):
+                pass
+            return
+
+        try:
+            i = 0
+            n = len(data)
+            while i < n:
+                ch = data[i]
+
+                # Arrow-key escape sequences: ESC [ A/B (Up/Down).
+                # Left/Right and anything else recognized but unhandled
+                # is simply swallowed rather than corrupting the buffer.
+                if ch == '\x1b' and i + 2 < n and data[i + 1] == '[':
+                    code = data[i + 2]
+                    if code == 'A':
+                        self.history_up()
+                    elif code == 'B':
+                        self.history_down()
+                    # 'C'/'D' (Right/Left) and others: ignored for now
+                    i += 3
+                    continue
+
+                if ch in ('\x7f', '\x08'):
+                    self.handle_backspace()
+                    i += 1
+                    continue
+
+                if ch in ('\n', '\r'):
+                    self.submit_current_line()
+                    i += 1
+                    continue
+
+                # Regular character: echo locally and buffer it
+                sys.stdout.write(ch)
+                sys.stdout.flush()
+                self.input_buffer += ch
+                i += 1
+
+        except Exception as e:
+            # Something in local line-editing went wrong. Report it rather
+            # than silently shipping the raw keystrokes off to the remote
+            # sftp session (that's what was causing 'help'/local commands
+            # to show up on the wrong side).
+            sys.stdout.write("\r\n[sftpy] input error: {0}\r\n".format(e))
+            sys.stdout.flush()
+            self.input_buffer = ''
+    
+    def run(self):
+        """Main loop - pass input/output between terminal and sftp"""
+        if not self.connected:
+            print("Not connected.")
+            return
+        
+        try:
+            # Set raw mode for interactive session
+            tty.setraw(sys.stdin.fileno())
+            self.old_stdin_flags = fcntl.fcntl(sys.stdin.fileno(), fcntl.F_GETFL)
+            fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, self.old_stdin_flags | os.O_NONBLOCK)
+            
+            # Main interactive loop
+            while True:
+                # Check if sftp process is still running
+                if self.process.poll() is not None:
+                    break
+                
+                # Watch stdin and master_fd
+                try:
+                    rlist, _, _ = select.select([sys.stdin.fileno(), self.master_fd], [], [], 0.1)
+                except (OSError, IOError):
+                    break
+                
+                for fd in rlist:
+                    if fd == sys.stdin.fileno():
+                        # Read from stdin and process commands
+                        try:
+                            data = os.read(sys.stdin.fileno(), 1024)
+                            if data:
+                                # If in local command mode, ignore input
+                                if self.in_local_command:
+                                    continue
+                                # process_input() handles echoing, backspace,
+                                # and arrow-key history recall itself
+                                self.process_input(data)
+                        except (OSError, IOError):
+                            pass
+                    
+                    elif fd == self.master_fd:
+                        # Read from sftp and write to stdout
+                        try:
+                            output = os.read(self.master_fd, 1024)
+                            if output:
+                                os.write(sys.stdout.fileno(), output)
+                                if not self.interactive:
+                                    self._check_prompt(output)
+                            else:
+                                # EOF
+                                return
+                        except (OSError, IOError):
+                            pass
+                
+        except KeyboardInterrupt:
+            print("\n")
+        finally:
+            self.cleanup()
+    
+    def cleanup(self):
+        """Clean up resources"""
+        # Restore terminal settings
+        if self.old_settings:
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSAFLUSH, self.old_settings)
+            except:
+                pass
+        
+        # Restore stdin flags
+        if hasattr(self, 'old_stdin_flags') and self.old_stdin_flags:
+            try:
+                fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, self.old_stdin_flags)
+            except:
+                pass
+        
+        # Close master fd
+        if self.master_fd:
+            try:
+                os.close(self.master_fd)
+            except:
+                pass
+        
+        # Terminate process
+        if self.process:
+            try:
+                self.process.terminate()
+                self.process.wait()
+            except:
+                pass
+        
+        print("\nGoodbye!")
+
+def print_usage():
+    """Print usage information"""
+    print("Usage: python sftpy.py <username@hostname> [-p port]")
+    print()
+    print("Arguments:")
+    print("  username@hostname    Target in format user@host")
+    print("  -p, --port           Port number (default: 22)")
+    print()
+    print("Examples:")
+    print("  python sftpy.py user@example.com")
+    print("  python sftpy.py user@example.com -p 2222")
+    sys.exit(1)
+
+def main():
+    if len(sys.argv) < 2:
+        print_usage()
+    
+    # Parse arguments
+    target = sys.argv[1]
+    port = 22
+    
+    # Check if target contains @
+    if '@' not in target:
+        print("Error: Target must be in format username@hostname")
+        print_usage()
+    
+    # Parse remaining arguments
+    remaining_args = sys.argv[2:]
+    i = 0
+    while i < len(remaining_args):
+        arg = remaining_args[i]
+        
+        if arg in ['-p', '--port']:
+            if i + 1 < len(remaining_args):
+                port = int(remaining_args[i + 1])
+                i += 2
+            else:
+                print("Error: Port number required after -p")
+                sys.exit(1)
+        elif arg in ['-h', '--help']:
+            print_usage()
+        else:
+            i += 1
+    
+    client = CustomSFTP()
+    
+    # Connect
+    if not client.connect(target, port):
+        sys.exit(1)
+    
+    # Start interactive session
+    client.run()
+
+if __name__ == "__main__":
+    main()

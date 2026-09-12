@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>shapez2 shape viewer</title>
+<style>
+  :root{
+    --bg:#14161c;
+    --panel:#1c1f27;
+    --border:#2c3040;
+    --text:#e7e9f0;
+    --sub:#8a90a4;
+    --accent:#5cc8ff;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: radial-gradient(circle at 20% 0%, #1a1e29 0%, #101218 60%);
+    color:var(--text);
+    min-height:100vh;
+    display:flex;
+    justify-content:center;
+    padding:32px 16px 60px;
+  }
+  .wrap{width:100%; max-width:900px;}
+  h1{font-size:20px; font-weight:600; margin:0 0 4px;}
+  .subtitle{color:var(--sub); font-size:13px; margin:0 0 22px;}
+  .panel{
+    background:var(--panel);
+    border:1px solid var(--border);
+    border-radius:12px;
+    padding:18px;
+    margin-bottom:18px;
+  }
+  label{display:block; font-size:12px; color:var(--sub); margin-bottom:8px; letter-spacing:.02em; text-transform:uppercase;}
+  textarea{
+    width:100%;
+    background:#0f1116;
+    border:1px solid var(--border);
+    border-radius:8px;
+    color:var(--accent);
+    font-family: "SF Mono", Consolas, monospace;
+    font-size:15px;
+    padding:12px;
+    resize:vertical;
+    min-height:56px;
+    outline:none;
+  }
+  textarea:focus{border-color:var(--accent);}
+  .err{color:#ff6b6b; font-size:13px; margin-top:8px; min-height:16px;}
+  .stage{
+    display:flex;
+    justify-content:center;
+    align-items:center;
+    padding:20px;
+  }
+  .legend{
+    display:grid;
+    grid-template-columns: 1fr 1fr;
+    gap:20px;
+    font-size:13px;
+  }
+  .legend h3{margin:0 0 8px; font-size:12px; color:var(--sub); text-transform:uppercase; letter-spacing:.02em;}
+  .legend-row{display:flex; align-items:center; gap:8px; padding:3px 0; color:var(--sub);}
+  .legend-row b{color:var(--text); width:16px; display:inline-block; font-family:monospace;}
+  .swatch{width:12px; height:12px; border-radius:3px; border:1px solid rgba(255,255,255,.25); flex-shrink:0;}
+  .hint{font-size:12px; color:var(--sub); margin-top:6px;}
+  code{background:#0f1116; padding:1px 5px; border-radius:4px; border:1px solid var(--border);}
+  .utils-row{display:flex; align-items:center; gap:18px; flex-wrap:wrap; margin-bottom:12px;}
+  button{
+    background:#232735;
+    color:var(--text);
+    border:1px solid var(--border);
+    border-radius:7px;
+    padding:9px 14px;
+    font-size:13px;
+    cursor:pointer;
+  }
+  button:hover{border-color:var(--accent); color:var(--accent);}
+  .group-input{display:flex; align-items:center; gap:8px; font-size:13px; color:var(--sub);}
+  .group-input input{
+    width:52px;
+    background:#0f1116;
+    border:1px solid var(--border);
+    border-radius:6px;
+    color:var(--text);
+    padding:6px 8px;
+    font-size:13px;
+  }
+  .highlight-view{
+    font-family:"SF Mono", Consolas, monospace;
+    font-size:15px;
+    line-height:1.9;
+    background:#0f1116;
+    border:1px solid var(--border);
+    border-radius:8px;
+    padding:12px;
+    word-break:break-all;
+  }
+  .highlight-view .quarter{
+    padding:1px 2px;
+    border-radius:3px;
+    font-weight:600;
+  }
+  .highlight-view .grp-a{background:#ffffff26;}
+  .highlight-view .grp-b{background:#ffffff00;}
+  .highlight-view .layer-block{white-space:nowrap;}
+  .highlight-view .sep{color:var(--sub); padding:0 2px; font-weight:700;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>shapez2 shape viewer</h1>
+  <p class="subtitle">Paste a shape code below to visualize it. Layers separated by <code>:</code>, each layer made of <code>shape+color</code> pairs.</p>
+
+  <div class="panel">
+    <label for="input">shape code</label>
+    <textarea id="input" spellcheck="false"></textarea>
+    <div class="err" id="err"></div>
+  </div>
+
+  <div class="panel">
+    <label>utilities</label>
+    <div class="utils-row">
+      <button id="flipBtn" type="button">Flip layer order (top ⇄ bottom)</button>
+      <button id="rotateBtn" type="button">Rotate ↻ (shift quarters)</button>
+      <button id="cycleBtn" type="button">Cycle layers (top → bottom)</button>
+      <div class="group-input">
+        <label for="groupSize">Highlight every</label>
+        <input type="number" id="groupSize" min="1" max="10" value="4">
+        <span>quarters</span>
+      </div>
+    </div>
+    <div id="highlightView" class="highlight-view"></div>
+  </div>
+
+  <div class="panel stage">
+    <div id="stage"></div>
+  </div>
+
+  <div class="panel legend">
+    <div>
+      <h3>shapes</h3>
+      <div class="legend-row"><b>C</b> circle</div>
+      <div class="legend-row"><b>R</b> rectangle</div>
+      <div class="legend-row"><b>S</b> star</div>
+      <div class="legend-row"><b>W</b> wedge</div>
+      <div class="legend-row"><b>P</b> pin (always uncolored)</div>
+      <div class="legend-row"><b>c</b> crystal</div>
+      <div class="legend-row"><b>X</b> 1/4 plus</div>
+      <div class="legend-row"><b>Y</b> 1/4 plus, cut top</div>
+      <div class="legend-row"><b>-</b> empty quarter</div>
+    </div>
+    <div>
+      <h3>colors</h3>
+      <div class="legend-row"><span class="swatch" style="background:#ff4b4b"></span><b>r</b> red</div>
+      <div class="legend-row"><span class="swatch" style="background:#4b7bff"></span><b>b</b> blue</div>
+      <div class="legend-row"><span class="swatch" style="background:#4bd671"></span><b>g</b> green</div>
+      <div class="legend-row"><span class="swatch" style="background:#4be0e0"></span><b>c</b> cyan</div>
+      <div class="legend-row"><span class="swatch" style="background:#d24bff"></span><b>m</b> magenta</div>
+      <div class="legend-row"><span class="swatch" style="background:#f2e14b"></span><b>y</b> yellow</div>
+      <div class="legend-row"><span class="swatch" style="background:#f2f2f2"></span><b>w</b> white</div>
+      <div class="legend-row"><span class="swatch" style="background:#3a3a40"></span><b>k</b> black</div>
+      <div class="legend-row"><span class="swatch" style="background:#8f96a8"></span><b>u</b> uncolored</div>
+      <div class="legend-row"><b>-</b> no color (pins only)</div>
+    </div>
+  </div>
+  <p class="hint">Layer 1 = outermost ring, higher layers stack inward. Up to 10 layers &times; 10 quarters supported.</p>
+</div>
+
+<script>
+const COLORS = {
+  r:'#ff4b4b', b:'#4b7bff', g:'#4bd671', c:'#4be0e0',
+  m:'#d24bff', y:'#f2e14b', w:'#f2f2f2', k:'#3a3a40',
+  u:'#8f96a8', '-':'#565c6e'
+};
+const VALID_COLORS = new Set(['r','b','g','c','m','y','w','k','u']);
+const VALID_SHAPES = new Set(['C','R','S','W','P','c','X','Y','-']);
+
+function polar(cx, cy, r, angleDeg){
+  const rad = (angleDeg - 90) * Math.PI / 180;
+  return [cx + r * Math.cos(rad), cy + r * Math.sin(rad)];
+}
+
+function arcPath(cx, cy, r1, r2, a0, a1, straightOuter){
+  const p0i = polar(cx, cy, r1, a0), p1i = polar(cx, cy, r1, a1);
+  const p0o = polar(cx, cy, r2, a0), p1o = polar(cx, cy, r2, a1);
+  const large = (a1 - a0) > 180 ? 1 : 0;
+  if (straightOuter){
+    return `M ${p0i[0]} ${p0i[1]} L ${p0o[0]} ${p0o[1]} L ${p1o[0]} ${p1o[1]} L ${p1i[0]} ${p1i[1]} Z`;
+  }
+  return `M ${p0i[0]} ${p0i[1]} L ${p0o[0]} ${p0o[1]} A ${r2} ${r2} 0 ${large} 1 ${p1o[0]} ${p1o[1]} L ${p1i[0]} ${p1i[1]} A ${r1} ${r1} 0 ${large} 0 ${p0i[0]} ${p0i[1]} Z`;
+}
+
+let hatchId = 0;
+function makeQuarterSVG(shape, colorKey, cx, cy, r1, r2, a0, a1){
+  const color = COLORS[colorKey] !== undefined ? COLORS[colorKey] : '#c04bff';
+  const mid = (a0 + a1) / 2;
+  let out = '';
+
+  if (shape === '-' || shape === undefined) {
+    return '';
+  }
+
+  if (shape === 'C'){
+    out += `<path d="${arcPath(cx,cy,r1,r2,a0,a1,false)}" fill="${color}" stroke="#0009" stroke-width="1"/>`;
+  }
+  else if (shape === 'W'){
+    // wedge: full quarter block, straight (non-arced) outer edge
+    out += `<path d="${arcPath(cx,cy,r1,r2,a0,a1,true)}" fill="${color}" stroke="#0009" stroke-width="1"/>`;
+  }
+  else if (shape === 'R'){
+    // rectangle: diamond-oriented square whose inner corner touches this ring's
+    // base (r1) and outer corner touches r2, so 4 quarters connect at the center
+    const rad = (mid - 90) * Math.PI / 180;
+    const ux = Math.cos(rad), uy = Math.sin(rad);   // outward radial unit vector
+    const vx = -Math.sin(rad), vy = Math.cos(rad);  // tangential unit vector
+    const half = (r2 - r1) / 2;
+    const rMid = (r1 + r2) / 2;
+    const baseX = cx + ux * rMid, baseY = cy + uy * rMid;
+    // local coords: [tangential, radial] -> inner tip, right, outer tip, left
+    const corners = [[0,-half],[half,0],[0,half],[-half,0]].map(([lx,ly]) => {
+      const px = baseX + vx*lx + ux*ly;
+      const py = baseY + vy*lx + uy*ly;
+      return `${px} ${py}`;
+    });
+    out += `<polygon points="${corners.join(' ')}" fill="${color}" stroke="#0009" stroke-width="1"/>`;
+  }
+  else if (shape === 'c'){
+    const pid = 'hatch' + (hatchId++);
+    out += `<defs><pattern id="${pid}" width="6" height="6" patternTransform="rotate(45)" patternUnits="userSpaceOnUse">
+      <rect width="6" height="6" fill="${color}"/>
+      <line x1="0" y1="0" x2="0" y2="6" stroke="#ffffff55" stroke-width="1.5"/>
+    </pattern></defs>`;
+    out += `<path d="${arcPath(cx,cy,r1,r2,a0,a1,false)}" fill="url(#${pid})" stroke="#0009" stroke-width="1"/>`;
+  }
+  else if (shape === 'S'){
+    const tip = polar(cx, cy, r2, mid);
+    const baseL = polar(cx, cy, r1, a0);
+    const baseR = polar(cx, cy, r1, a1);
+    const midL = polar(cx, cy, (r1+r2)/2 * 0.82, a0 + (a1-a0)*0.28);
+    const midR = polar(cx, cy, (r1+r2)/2 * 0.82, a0 + (a1-a0)*0.72);
+    out += `<path d="M ${baseL[0]} ${baseL[1]} L ${midL[0]} ${midL[1]} L ${tip[0]} ${tip[1]} L ${midR[0]} ${midR[1]} L ${baseR[0]} ${baseR[1]} Z" fill="${color}" stroke="#0009" stroke-width="1"/>`;
+  }
+  else if (shape === 'P'){
+    const tip = polar(cx, cy, r2*0.94, mid);
+    const base = polar(cx, cy, r1 + (r2-r1)*0.15, mid);
+    out += `<line x1="${base[0]}" y1="${base[1]}" x2="${tip[0]}" y2="${tip[1]}" stroke="${color}" stroke-width="4" stroke-linecap="round"/>`;
+    out += `<circle cx="${tip[0]}" cy="${tip[1]}" r="3.2" fill="${color}"/>`;
+  }
+  else if (shape === 'X' || shape === 'Y'){
+    // goes all the way down to the base of the layer (r1), narrower than a full quarter
+    const rr1 = r1;
+    const rr2 = r1 + (r2-r1)*0.62;
+    const aa0 = a0 + (a1-a0)*0.14;
+    const aa1 = a0 + (a1-a0)*0.86;
+    if (shape === 'X'){
+      out += `<path d="${arcPath(cx,cy,rr1,rr2,aa0,aa1,true)}" fill="${color}" stroke="#0009" stroke-width="1"/>`;
+    } else {
+      const p0i = polar(cx,cy,rr1,aa0), p1i = polar(cx,cy,rr1,aa1);
+      const p0o = polar(cx,cy,rr2,aa0), p1o = polar(cx,cy,rr2,aa1);
+      const cutMid = polar(cx,cy, rr1 + (rr2-rr1)*0.35, mid);
+      out += `<path d="M ${p0i[0]} ${p0i[1]} L ${p0o[0]} ${p0o[1]} L ${cutMid[0]} ${cutMid[1]} L ${p1o[0]} ${p1o[1]} L ${p1i[0]} ${p1i[1]} Z" fill="${color}" stroke="#0009" stroke-width="1"/>`;
+    }
+  }
+  else {
+    // unknown shape letter - draw pie slice with a "?" marker
+    out += `<path d="${arcPath(cx,cy,r1,r2,a0,a1,false)}" fill="${color}" opacity="0.5" stroke="#0009" stroke-width="1" stroke-dasharray="3 2"/>`;
+    const m = polar(cx, cy, (r1+r2)/2, mid);
+    out += `<text x="${m[0]}" y="${m[1]+4}" font-size="11" fill="#fff" text-anchor="middle" font-family="monospace">${shape}</text>`;
+  }
+  return out;
+}
+
+function parseShapeCode(code){
+  code = code.trim();
+  if (!code) throw new Error('Enter a shape code.');
+  const layerStrs = code.split(':');
+  if (layerStrs.length > 10) throw new Error('Too many layers (max 10).');
+  const layers = [];
+  const warnings = [];
+  layerStrs.forEach((layerStr, li) => {
+    if (layerStr.length % 2 !== 0) {
+      throw new Error(`Layer ${li+1} ("${layerStr}") has an odd number of characters — shape+color pairs expected.`);
+    }
+    const quarters = [];
+    for (let i = 0; i < layerStr.length; i += 2){
+      let shape = layerStr[i];
+      let color = layerStr[i+1];
+
+      if (shape !== '-' && !VALID_COLORS.has(color) && color !== '-') {
+        throw new Error(`Layer ${li+1}, quarter ${i/2+1}: "${color}" is not a valid color letter.`);
+      }
+      if (color === '-' && shape !== 'P' && shape !== '-') {
+        throw new Error(`Layer ${li+1}, quarter ${i/2+1}: "-" is not a valid color (it's reserved for uncolored pins).`);
+      }
+      if (shape === 'P' && color !== '-') {
+        // pins can never be colored — auto-fix and warn instead of hard failing
+        warnings.push(`Layer ${li+1}, quarter ${i/2+1}: pins can't be colored, "${color}" was replaced with "-".`);
+        color = '-';
+      }
+      quarters.push({ shape, color });
+    }
+    if (quarters.length > 10) throw new Error(`Layer ${li+1} has more than 10 quarters.`);
+    if (quarters.length === 0) throw new Error(`Layer ${li+1} is empty.`);
+    layers.push(quarters);
+  });
+  return { layers, warnings };
+}
+
+function renderHighlight(){
+  const view = document.getElementById('highlightView');
+  const code = document.getElementById('input').value;
+  const groupSize = Math.max(1, parseInt(document.getElementById('groupSize').value, 10) || 4);
+  const layerStrs = code.split(':');
+  let html = '';
+  layerStrs.forEach((layerStr, li) => {
+    let inner = '';
+    let qi = 0;
+    for (let i = 0; i < layerStr.length; i += 2){
+      const shape = layerStr[i] || '';
+      const color = layerStr[i+1] || '';
+      const grp = Math.floor(qi / groupSize) % 2 === 0 ? 'grp-a' : 'grp-b';
+      const colorHex = COLORS[color] !== undefined ? COLORS[color] : '#c04bff';
+      inner += `<span class="quarter ${grp}" style="color:${colorHex}">${shape}${color || ''}</span>`;
+      qi++;
+    }
+    // odd leftover character (malformed input) still shown, uncolored
+    if (layerStr.length % 2 !== 0){
+      inner += `<span class="quarter" style="color:#ff6b6b">${layerStr[layerStr.length-1]}</span>`;
+    }
+    html += `<span class="layer-block">${inner}</span>`;
+    if (li < layerStrs.length - 1) html += `<span class="sep">:</span>`;
+  });
+  view.innerHTML = html;
+}
+
+function render(){
+  const input = document.getElementById('input');
+  const errEl = document.getElementById('err');
+  const stage = document.getElementById('stage');
+  hatchId = 0;
+  renderHighlight();
+  let layers, warnings;
+  try {
+    ({ layers, warnings } = parseShapeCode(input.value));
+    errEl.innerHTML = warnings.length ? warnings.map(w => `⚠ ${w}`).join('<br>') : '';
+    errEl.style.color = 'var(--sub)';
+  } catch(e){
+    errEl.textContent = e.message;
+    errEl.style.color = '#ff6b6b';
+    stage.innerHTML = '';
+    return;
+  }
+
+  const size = 480;
+  const cx = size/2, cy = size/2;
+  const centerHole = 22;
+  const maxOuter = size/2 - 14;
+  const ringWidth = (maxOuter - centerHole) / Math.max(layers.length, 1);
+  const ringGap = 2;
+
+  let svg = `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" xmlns="http://www.w3.org/2000/svg">`;
+  svg += `<circle cx="${cx}" cy="${cy}" r="${maxOuter+2}" fill="#0f1116" stroke="#2c3040" stroke-width="1"/>`;
+
+  layers.forEach((quarters, li) => {
+    const ri = layers.length - 1 - li; // reverse: last layer drawn innermost, layer 1 outermost
+    const r1 = centerHole + ri * ringWidth;
+    const r2 = centerHole + (ri+1) * ringWidth - ringGap;
+    const n = quarters.length;
+    const step = 360 / n;
+    quarters.forEach((q, qi) => {
+      const a0 = qi * step;
+      const a1 = a0 + step;
+      svg += makeQuarterSVG(q.shape, q.color, cx, cy, r1, r2, a0, a1);
+    });
+    // ring guide lines
+    for (let qi = 0; qi < n; qi++){
+      const a = qi * step;
+      const pi = polar(cx, cy, r1, a), po = polar(cx, cy, r2, a);
+      svg += `<line x1="${pi[0]}" y1="${pi[1]}" x2="${po[0]}" y2="${po[1]}" stroke="#ffffff14" stroke-width="1"/>`;
+    }
+    svg += `<circle cx="${cx}" cy="${cy}" r="${r2}" fill="none" stroke="#ffffff14" stroke-width="1"/>`;
+  });
+
+  svg += `<circle cx="${cx}" cy="${cy}" r="${centerHole-2}" fill="#0f1116" stroke="#2c3040" stroke-width="1"/>`;
+  svg += `</svg>`;
+  stage.innerHTML = svg;
+}
+
+const input = document.getElementById('input');
+input.value = 'CuWmWuWy:CcWmCcWm:CwWcCwWc:XuckXuck:Cucccccc:WwWwRwWw:P-YuP-Yu:CccwYwCb';
+input.addEventListener('input', render);
+
+document.getElementById('groupSize').addEventListener('input', renderHighlight);
+
+document.getElementById('flipBtn').addEventListener('click', () => {
+  const layers = input.value.split(':');
+  input.value = layers.reverse().join(':');
+  render();
+});
+
+document.getElementById('rotateBtn').addEventListener('click', () => {
+  const layers = input.value.split(':').map(layerStr => {
+    if (layerStr.length < 4 || layerStr.length % 2 !== 0) return layerStr;
+    // rotate quarters within the layer by one position (clockwise)
+    const pairs = [];
+    for (let i = 0; i < layerStr.length; i += 2) pairs.push(layerStr.slice(i, i+2));
+    pairs.unshift(pairs.pop());
+    return pairs.join('');
+  });
+  input.value = layers.join(':');
+  render();
+});
+
+document.getElementById('cycleBtn').addEventListener('click', () => {
+  const layers = input.value.split(':');
+  if (layers.length > 1) layers.push(layers.shift());
+  input.value = layers.join(':');
+  render();
+});
+
+render();
+</script>
+</body>
+</html>

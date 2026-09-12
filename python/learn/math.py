@@ -4,7 +4,7 @@ py = math.pi;
 
 print(py);
 print(round(py, 2));
-print(py:.2f); # easier and does the same
+print(f"{py:.2f}"); # easier and does the same
 print(math.sqrt(9));
 
 

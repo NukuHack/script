@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# Unified check/build script for Rust projects.
+#
+# Default: native cargo pipeline (build/test/run via cargo).
+# --web:   WASM pipeline (wasm-pack build, browser-based tests, no direct run).
+#
+# Usage: ./build.sh [-y | -c | -n | -q | -r] [--web]
+#   -y      Run all checks and tests (including Miri, best-effort), then build
+#   -c      Like -y but WITHOUT Miri
+#   -n      Skip everything except build
+#   -q      Quick: only unit tests (cargo test --lib), then build
+#   -r      Same as -y; on native it then runs the app, on --web it prints a
+#           "ready to run in release" hint (WASM can't be executed directly)
+#   --web   Use the WASM pipeline (wasm-pack) instead of the native cargo one
+#   -h      Show this help
+set -euo pipefail
+
+# ── Config ──
+MAX_LINE_WIDTH=150
+MAX_FILE_LINES=500
+RUSTFMT_TOML="rustfmt.toml"
+
+# ── State ──
+RUN_ALL=false
+SKIP_ALL=false
+QUICK=false
+RUN_MIRI=false
+READY_TO_RUN=false
+WEB_BUILD=false
+
+usage() {
+  cat <<EOF
+Usage: $0 [-y | -c | -n | -q | -r] [--web]
+  -y      Run all checks and tests (incl. Miri), then build
+  -c      All checks and tests, NO Miri
+  -n      Skip everything except build
+  -q      Quick: only unit tests, then build
+  -r      Same as -y; then run the app (native) or print a serve hint (--web)
+  --web   Use the WASM pipeline (wasm-pack) instead of the native cargo one
+  -h      Show this help
+EOF
+}
+
+# ── Parse flags ──
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -y) RUN_ALL=true; RUN_MIRI=true; shift ;;
+    -c) RUN_ALL=true; shift ;;
+    -n) SKIP_ALL=true; shift ;;
+    -q) QUICK=true; shift ;;
+    -r) RUN_ALL=true; RUN_MIRI=true; READY_TO_RUN=true; shift ;;
+    --web) WEB_BUILD=true; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage; exit 1 ;;
+  esac
+done
+
+if ! $RUN_ALL && ! $SKIP_ALL && ! $QUICK; then
+  usage
+  exit 1
+fi
+
+# ── Sanity: must be a Rust (Cargo) project ──
+if [[ ! -f Cargo.toml ]]; then
+  echo "ERROR: Cargo.toml not found in $(pwd)."
+  echo "       Run this script from the root of a Rust (Cargo) project."
+  exit 1
+fi
+
+echo "==> Checking prerequisites..."
+command -v cargo  >/dev/null || { echo "ERROR: cargo not found. Install from https://rustup.rs"; exit 1; }
+command -v rustup >/dev/null || { echo "ERROR: rustup not found. Install from https://rustup.rs"; exit 1; }
+
+if $WEB_BUILD; then
+  command -v wasm-pack >/dev/null || { echo "INFO: Installing wasm-pack..."; cargo install wasm-pack; }
+  echo "==> Adding wasm32 target..."
+  rustup target add wasm32-unknown-unknown
+fi
+
+# ── Ensure rustfmt.toml exists with our preferred config ──
+if [[ ! -f "$RUSTFMT_TOML" ]]; then
+  echo "==> Creating $RUSTFMT_TOML"
+  cat > "$RUSTFMT_TOML" <<'EOF'
+# Stable rustfmt configuration
+hard_tabs = true
+tab_spaces = 4
+max_width = 150
+newline_style = "Unix"
+edition = "2024"
+reorder_imports = true
+use_field_init_shorthand = true
+use_try_shorthand = true
+use_small_heuristics = "Max"
+EOF
+else
+  echo "==> Using existing $RUSTFMT_TOML"
+fi
+
+# ── Checks & Tests ──
+if $SKIP_ALL; then
+  echo "==> Skipping all checks and tests (-n flag)."
+else
+  # Formatting and linting (skip for quick mode)
+  if ! $QUICK; then
+    echo "==> Running cargo fmt"
+    cargo fmt --all
+
+    echo "==> Running cargo clippy"
+    cargo clippy --all-targets -- -D warnings
+
+    echo "==> Checking file and line length (warnings only)"
+    while IFS= read -r file; do
+      total_lines=$(wc -l < "$file")
+      if (( total_lines > MAX_FILE_LINES )); then
+        echo "WARN: $file has $total_lines lines (limit: $MAX_FILE_LINES) — consider splitting into submodules"
+      fi
+      awk -v file="$file" -v max="$MAX_LINE_WIDTH" '
+        length($0) > max {
+          printf "WARN: %s:%d exceeds %d chars (%d)\n", file, NR, max, length($0)
+        }
+      ' "$file"
+    done < <(find . -type f -name "*.rs" -not -path "./target/*")
+  fi
+
+  # Quick mode: unit tests only. Full mode (-y/-r) runs the whole suite below.
+  if ! $RUN_ALL; then
+    echo "==> Running pure-logic tests (cargo test --lib)..."
+    set +e
+    cargo test --lib
+    LIB_TEST_STATUS=$?
+    set -e
+    (( LIB_TEST_STATUS == 0 )) || echo "==> WARNING: pure-logic tests failed (exit $LIB_TEST_STATUS). Continuing anyway."
+  fi
+
+  # Full test suite (+ DOM tests when --web) (+ Miri unless -c)
+  if $RUN_ALL; then
+    echo "==> Running all tests (unit, integration, docs)..."
+    set +e
+    cargo test
+    ALL_TEST_STATUS=$?
+    set -e
+    (( ALL_TEST_STATUS == 0 )) || echo "==> WARNING: full test suite failed (exit $ALL_TEST_STATUS). Continuing anyway."
+
+    if $WEB_BUILD; then
+      echo "==> Running DOM-backed tests (wasm-pack test --headless --firefox)..."
+      set +e
+      wasm-pack test --headless --firefox
+      WASM_TEST_STATUS=$?
+      set -e
+      if (( WASM_TEST_STATUS != 0 )); then
+        echo "==> WARNING: DOM-backed tests failed or the browser driver could not run (exit $WASM_TEST_STATUS)."
+        echo "    Continuing to build anyway."
+      fi
+    fi
+
+    if $RUN_MIRI; then
+      if command -v cargo-miri >/dev/null 2>&1 || cargo +nightly miri --version >/dev/null 2>&1; then
+        echo "==> Running cargo miri test --lib"
+        # Native: -Zmiri-disable-isolation lets fs-backed tests run.
+        # Web: keep the same flag for symmetry; harmless either way.
+        if ! MIRIFLAGS="-Zmiri-disable-isolation" cargo +nightly miri test --lib; then
+          echo "WARN: cargo miri test --lib failed or found UB — investigate before trusting unsafe code"
+        fi
+      else
+        echo "==> Skipping Miri (nightly + 'miri' rustup component not found)"
+      fi
+    else
+      echo "==> Skipping Miri (-c flag)."
+    fi
+  fi
+fi
+
+# ── Build ──
+if $WEB_BUILD; then
+  echo "==> Building release (wasm-pack --target web)..."
+  wasm-pack build --target web --release
+  echo "==> Build complete. Output in pkg/"
+else
+  echo "==> Building release..."
+  cargo build --release
+  echo "==> Build complete. Binary available at target/release/app."
+fi
+
+# ── Run / hint ──
+if $READY_TO_RUN; then
+  if $WEB_BUILD; then
+    echo "==> Ready to run in release."
+    echo "    Serve the generated bundle, e.g.:"
+    echo "      python3 -m http.server 8000 --directory pkg"
+    echo "    Then open http://localhost:8000/ in your browser."
+  else
+    echo "==> Running app (cargo run --release)..."
+    cargo run --release
+  fi
+fi

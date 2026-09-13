@@ -51,3 +51,4 @@ Python basics.
 | Project | Description |
 |---|---|
 | `macro` | A simple (Linux) macro I use. |
+| `combine` | A simple cimbiner (folders to txt). |

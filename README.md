@@ -53,3 +53,5 @@ Python basics.
 | `macro` | A simple (Linux) macro I use. |
 | `combine` | A simple cimbiner (folders to txt). |
 | `build` | A basic rust run script |
+| `cleanup` | A small script for cleaning out old files|
+

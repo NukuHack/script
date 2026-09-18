@@ -1,25 +1,9 @@
 #!/usr/bin/env python3
-"""
-All-in-one, SINGLE-FILE launcher for connecting a Mineflayer bot to a
-Minecraft server via ViaProxy (protocol translation), even when mineflayer
-itself doesn't support the server's exact version yet.
+"""Single-file launcher for running a Mineflayer bot on any Minecraft server.
 
-Improvements applied:
-  - Optimized visualizer: colors are precomputed once per chunk scan (no more
-    per-pixel regex matching), giving a large render speedup.
-  - Map is now player-relative: the world rotates under the player, so the
-    player marker always points "up" on screen. The marker is drawn as a
-    fixed overlay in the browser (cheap, and always visible).
-  - Live coordinates + facing shown in a HUD box in the top-right corner,
-    polled independently of the map image so it updates quickly even if the
-    map itself renders more slowly.
-  - Added Q/E turning (smooth continuous turn while held), alongside WASD +
-    space.
-  - Windows-friendly DNS: added fallback nslookup parsing for guaranteed SRV
-    resolution.
-  - Process safety: registered Python 'atexit' hooks to prevent leftover
-    Java/Node processes.
-  - Added CLI color support and extra local bot commands (.help, .status).
+ViaProxy bridges protocol versions Mineflayer doesn't support natively. The
+launcher downloads and starts ViaProxy, points the bot at it, and serves a
+live top-down map of the surrounding chunks through a small HTTP server.
 """
 
 import atexit
@@ -27,20 +11,53 @@ import json
 import os
 import re
 import shutil
-import signal
 import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 
-# ANSI Colors for Terminal Output
+# ANSI colors for terminal output.
 CLR_RESET = "\033[0m"
 CLR_GREEN = "\033[92m"
 CLR_YELLOW = "\033[93m"
 CLR_RED = "\033[91m"
 CLR_CYAN = "\033[96m"
+
+USAGE = """\
+Usage:
+  python mc_server.py [options] <host>[:<port>] [port] [version]
+
+Connects a Mineflayer bot to a Minecraft server, using ViaProxy to translate
+protocol versions when needed.
+
+Modes:
+  (no arguments)             Show this help message.
+  --status <host>[:<port>]   Ping the server and print its status, then exit.
+  --setup, --setup-account   Log in to a Microsoft account and save it for
+                             later use. Required before connecting with
+                             --online to an online-mode server.
+
+Options:
+  --online                   Authenticate with the saved Microsoft account.
+  --protocol <N>             Protocol version for the status ping.
+  --json                     Print full status JSON (with --status).
+  -h, --help                 Show this help message.
+
+Arguments:
+  host[:port]                Target server. SRV records are resolved
+                             automatically when no port is given.
+  port                       Server port (default: 25565).
+  version                    Mineflayer client version (default: 1.21.11).
+
+Examples:
+  python mc_server.py play.example.com
+  python mc_server.py play.example.com 25565 1.21.11 --online
+  python mc_server.py --status play.example.com --json
+  python mc_server.py --setup
+"""
 
 INDEX_JS_SOURCE = r"""#!/usr/bin/env node
 // Console Minecraft bot using Mineflayer
@@ -339,22 +356,21 @@ module.exports = function visualizerPlugin(opts = {}) {
   const httpPort = opts.httpPort || 8095;
   const outFile = opts.outFile || path.join(__dirname, 'world.png');
   const VIEW_RADIUS = opts.viewRadius || 96;
-  // Minimum time between successive re-renders. Lowered from the previous
-  // 200ms so the map (and the HUD, which is decoupled from it anyway) feels
-  // noticeably snappier without saturating the CPU.
+  // Minimum interval between re-renders. Small enough that the map feels
+  // live, large enough not to saturate the CPU.
   const RENDER_INTERVAL_MS = opts.renderIntervalMs || 100;
   const TURN_SPEED = opts.turnSpeedRadPerSec || Math.PI * 0.9; // ~162°/s
 
   return function inject(bot) {
     currentBot = bot;
-    // key -> Uint8Array(16*16*3), colors precomputed once at scan time so
-    // rendering never has to run a regex per pixel again.
+    // key -> Uint8Array(16*16*3) with colors already resolved, so rendering
+    // never has to run a regex per pixel.
     const columns = new Map();
     let dirty = false;
 
     function keyOf(cx, cz) { return cx + ',' + cz; }
 
-    // Reusable Vec3 instance to eliminate GC overhead during chunk scans.
+    // Reused during chunk scans to avoid allocating a Vec3 per block lookup.
     const scanVec = new Vec3(0, 0, 0);
 
     function scanColumn(chunkX, chunkZ) {
@@ -386,8 +402,8 @@ module.exports = function visualizerPlugin(opts = {}) {
       dirty = true;
     }
 
-    // Writes the RGB for world block coords (bx, bz) into `out` (length-3
-    // array). Returns false if that chunk hasn't been scanned yet.
+    // Fills `out` with the RGB for world block coords (bx, bz). Returns false
+    // when that chunk hasn't been scanned yet.
     function colorAt(bx, bz, out) {
       const cx = Math.floor(bx / 16), cz = Math.floor(bz / 16);
       const grid = columns.get(keyOf(cx, cz));
@@ -402,11 +418,9 @@ module.exports = function visualizerPlugin(opts = {}) {
     let renderQueued = false;
     const tmp = [0, 0, 0];
 
-    // The map is rendered player-relative and rotated so the direction the
-    // player is facing always points to the top of the image. That means
-    // the player marker itself never needs to rotate — it's drawn as a
-    // fixed "up" arrow overlay in the browser instead of being baked into
-    // the PNG, which is both cheaper and guarantees it's always visible.
+    // The map is rendered player-relative and rotated so that "forward" is
+    // always at the top of the image. The marker itself is a fixed overlay in
+    // the browser, so it never has to be baked into the PNG.
     function render() {
       if (!dirty || !bot.entity) return;
       if (writing) { renderQueued = true; return; }
@@ -417,21 +431,19 @@ module.exports = function visualizerPlugin(opts = {}) {
       const centerZ = bot.entity.position.z;
       const yaw = bot.entity.yaw || 0;
 
-      // Forward vector (world space) for the direction the player faces.
       const fx = -Math.sin(yaw), fz = -Math.cos(yaw);
 
       const size = VIEW_RADIUS * 2 + 1;
       const half = VIEW_RADIUS;
       const png = new PNG({ width: size, height: size });
 
-      // For every screen pixel, rotate back into world space to find which
-      // block color to sample. This keeps "forward" pointing at the top of
-      // the image regardless of which way the player is actually facing.
+      // For each screen pixel, rotate back into world space to find the
+      // block to sample. Keeps "forward" at the top of the image for any yaw.
       for (let iv = 0; iv < size; iv++) {
-        const dv = iv - half; // screen-down offset from player
+        const dv = iv - half;
         const rowBase = iv * size;
         for (let iu = 0; iu < size; iu++) {
-          const du = iu - half; // screen-right offset from player
+          const du = iu - half;
           const wx = fz * du - fx * dv;
           const wz = -fx * du - fz * dv;
           const bx = Math.floor(centerX + wx);
@@ -468,13 +480,12 @@ module.exports = function visualizerPlugin(opts = {}) {
       requestRender();
     });
 
-    // physicsTick fires ~20/s and covers both movement and turning (since
-    // the map rotates with yaw, a turn-in-place needs a re-render too).
-    // requestRender() throttles this down to RENDER_INTERVAL_MS internally.
+    // physicsTick fires ~20/s and covers movement and yaw changes; the map
+    // rotates with yaw, so turn-in-place needs a re-render too.
     bot.on('physicsTick', () => requestRender());
 
     // --- Q/E smooth turning -------------------------------------------------
-    let turnDir = 0; // -1 = turning left (Q), 1 = turning right (E), 0 = none
+    let turnDir = 0; // -1 = left (Q), 1 = right (E), 0 = none
     let lastTurnTickAt = Date.now();
     const turnInterval = setInterval(() => {
       const now = Date.now();
@@ -517,8 +528,8 @@ module.exports = function visualizerPlugin(opts = {}) {
           return;
         }
 
-        // Lightweight JSON endpoint so the HUD (coords/facing) can be
-        // polled quickly and independently of the (heavier) map image.
+        // Cheap JSON endpoint so the HUD can poll quickly without refetching
+        // the (heavier) map image.
         if (urlPath === '/state') {
           const e = currentBot.entity;
           const state = e ? {
@@ -555,9 +566,8 @@ module.exports = function visualizerPlugin(opts = {}) {
         res.end(`<!doctype html><html><body style="margin:0;background:#111;overflow:hidden">
 <div id="wrap" style="position:relative;width:100%;line-height:0">
   <img id="w" src="/world.png" style="image-rendering:pixelated;width:100%;display:block">
-  <!-- Fixed "always faces up" player marker. The map rotates underneath
-       this instead of the marker rotating on the map, so it never has to
-       move and can never fail to render. -->
+  <!-- The map rotates underneath this marker so it can stay put and never
+       fail to render. -->
   <svg id="marker" width="28" height="28" viewBox="0 0 28 28"
        style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);pointer-events:none;filter:drop-shadow(0 0 2px #000)">
     <polygon points="14,2 24,24 14,18 4,24" fill="#e62828" stroke="#fff" stroke-width="1"/>
@@ -570,11 +580,11 @@ module.exports = function visualizerPlugin(opts = {}) {
 const img = document.getElementById('w');
 const hud = document.getElementById('hud');
 
-// Map image is the heavier fetch — refresh at a moderate rate.
+// Map image is the heavier fetch; refresh at a moderate rate.
 setInterval(() => { img.src = '/world.png?' + Date.now(); }, 250);
 
-// HUD (coords/facing/health) is cheap JSON — refresh quickly so movement
-// and jumping are visibly reflected right away even between map frames.
+// HUD state is cheap JSON, so refresh it fast enough that movement and
+// jumping are visible between map frames.
 function dirName(yaw) {
   const deg = ((-yaw * 180 / Math.PI) % 360 + 360) % 360;
   const dirs = ['S','SW','W','NW','N','NE','E','SE'];
@@ -741,6 +751,9 @@ def _system_resolvers():
 
 
 def _query_srv_record(name, timeout=2.5):
+    """Send the SRV query ourselves because most OS stub resolvers don't
+    expose SRV lookups through the standard library.
+    """
     import random
     tid = random.randint(0, 0xFFFF)
     header = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0)
@@ -780,7 +793,9 @@ def _query_srv_record(name, timeout=2.5):
 
 
 def _query_srv_nslookup(hostname):
-    """Fallback Windows/Linux system nslookup command parser."""
+    """Fallback that shells out to nslookup, which works on Windows and Linux
+    when the raw UDP query above is blocked.
+    """
     try:
         out = subprocess.check_output(
             ["nslookup", "-type=SRV", f"_minecraft._tcp.{hostname}"],
@@ -887,8 +902,8 @@ def run_status_only(argv):
     show_json = "--json" in args
     args = [a for a in args if a != "--json"]
 
-    if len(args) < 1:
-        print("Usage: python launch.py --status <IP[:PORT]> [PORT] [--json] [--protocol N]")
+    if not args:
+        print("Usage: python mc_server.py --status <IP[:PORT]> [PORT] [--json] [--protocol N]")
         sys.exit(1)
 
     ip = _normalize_host_input(args[0])
@@ -932,6 +947,9 @@ def log(msg):
 
 
 def _detect_bot_dir():
+    """Materialize the embedded bot sources under ./bot, wiping node_modules
+    when anything changed so npm reinstalls against the new package.json.
+    """
     sub = os.path.join(SCRIPT_DIR, "bot")
     os.makedirs(sub, exist_ok=True)
 
@@ -967,7 +985,7 @@ def parse_target(argv):
     args = [a for a in args if a != "--online"]
 
     if not args:
-        print(__doc__)
+        print(USAGE)
         sys.exit(1)
 
     a = _normalize_host_input(args.pop(0))
@@ -1054,6 +1072,9 @@ def _fetch_via_api():
 
 
 def _fetch_via_redirect_and_scrape():
+    """Fallback for when the GitHub API is rate-limited: follow the
+    /releases/latest redirect and scrape the jar link from the HTML.
+    """
     latest_url = "https://github.com/ViaVersion/ViaProxy/releases/latest"
     req = urllib.request.Request(latest_url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=20) as resp:
@@ -1155,7 +1176,6 @@ def start_viaproxy(jar_path, java_bin, target_host, target_port, bind_port, onli
             terminate_all()
             sys.exit(1)
 
-    import threading
     def pump():
         for line in proc.stdout:
             clean = re.sub(r"\x1b\[[0-9;]*m", "", line).rstrip()
@@ -1166,12 +1186,11 @@ def start_viaproxy(jar_path, java_bin, target_host, target_port, bind_port, onli
 
 
 def has_saved_account():
-    """Best-effort check for whether `--setup` has been run and an account
-    was actually saved. ViaProxy persists added accounts (including the auth
-    token) in saves.json in its working directory. Rather than assume its
-    exact schema, look for content that only shows up once a real account
-    has been added (a username/token/microsoft entry), since the file may
-    exist with baseline config even before any account is added.
+    """Best-effort check for whether --setup has saved a Microsoft account.
+
+    ViaProxy persists added accounts in its working directory. Rather than
+    assume a specific schema, we look for markers that only appear once a real
+    account has been added, since baseline config files may exist regardless.
     """
     for name in ("saves.json", "accounts.json", "account.json"):
         path = os.path.join(VIAPROXY_DIR, name)
@@ -1189,10 +1208,9 @@ def has_saved_account():
 
 
 def setup_account(jar_path, java_bin):
-    """Runs ViaProxy's interactive CLI console so the user can add a Microsoft
-    account (device code login) for servers that require online mode. Fully
-    interactive: stdin/stdout are inherited so the user can type commands and
-    follow the device-code login flow directly.
+    """Run ViaProxy's interactive CLI so the user can add a Microsoft account
+    via the device-code flow. Stdin/stdout are inherited so the user can type
+    commands directly.
     """
     log("Starting ViaProxy in interactive mode so you can add a Microsoft account.")
     log("Once it's running, type:  account add")
@@ -1253,6 +1271,10 @@ atexit.register(terminate_all)
 def main():
     global BOT_DIR, VIAPROXY_DIR
 
+    if len(sys.argv) < 2 or any(a in ("-h", "--help") for a in sys.argv[1:]):
+        print(USAGE)
+        return
+
     if "--status" in sys.argv[1:]:
         run_status_only([a for a in sys.argv[1:] if a != "--status"])
         return
@@ -1272,7 +1294,7 @@ def main():
     if online_mode and not has_saved_account():
         log("No Microsoft account found yet.")
         log("Online-mode servers need a saved account to authenticate as.")
-        log("Run this first, then try again:  python launch.py --setup")
+        log("Run this first, then try again:  python mc_server.py --setup")
         sys.exit(1)
 
     log(f"Checking server status at {host}:{port}...")

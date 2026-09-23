@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
 downloader.py - Simple resumable file downloader (console or GUI).
 
@@ -31,7 +31,23 @@ import shutil
 import argparse
 import subprocess
 import threading
-from urllib.parse import urlparse, parse_qs, unquote
+
+try:
+    from urllib.parse import urlparse, parse_qs, unquote
+except ImportError:
+    from urlparse import urlparse, parse_qs
+    from urllib import unquote
+
+try:
+    import tkinter as tk
+except ImportError:
+    import Tkinter as tk
+
+try:
+    from tkinter import ttk, messagebox
+except ImportError:
+    import ttk
+    import tkMessageBox as messagebox
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +85,7 @@ def find_partial(output):
     return best
 
 
-def prepare_resume(output, log=print):
+def prepare_resume(output, log=None):
     """Copy the best partial file found (if any) to the target output name.
 
     Uses a copy rather than a rename/move on purpose: the original partial
@@ -78,22 +94,24 @@ def prepare_resume(output, log=print):
     is still there and the next run can simply try again from it, instead of
     having lost or corrupted the only copy of the partial data.
     """
+    if log is None:
+        log = print
     partial = find_partial(output)
     if partial is None:
         log("No partial file found. Starting fresh download.")
         return
     if partial == output:
-        log(f"Found existing file '{output}'. Will attempt to resume.")
+        log("Found existing file '{}'. Will attempt to resume.".format(output))
         return
     # A differently-named partial file was found and is the best (or only) candidate.
     if os.path.exists(output) and os.path.getsize(output) >= os.path.getsize(partial):
-        log(f"Existing '{output}' is already as large or larger; keeping it.")
+        log("Existing '{}' is already as large or larger; keeping it.".format(output))
         return
     try:
         shutil.copy2(partial, output)
-        log(f"Copied partial file '{partial}' -> '{output}' (original left in place)")
+        log("Copied partial file '{}' -> '{}' (original left in place)".format(partial, output))
     except Exception as e:
-        log(f"Could not copy partial file '{partial}': {e}. Starting fresh.")
+        log("Could not copy partial file '{}': {}. Starting fresh.".format(partial, e))
 
 
 def build_wget_cmd(url, output):
@@ -109,17 +127,17 @@ def download_console(url, output=None, max_retries=10, retry_delay=5):
     prepare_resume(output)
 
     for attempt in range(1, max_retries + 1):
-        print(f"Attempt {attempt}/{max_retries}: downloading '{output}'...")
-        result = subprocess.run(build_wget_cmd(url, output))
-        if result.returncode == 0:
-            print(f"Download completed successfully: {output}")
+        print("Attempt {}/{}: downloading '{}'...".format(attempt, max_retries, output))
+        result = subprocess.call(build_wget_cmd(url, output))
+        if result == 0:
+            print("Download completed successfully: {}".format(output))
             return True
-        print(f"Attempt {attempt} failed.")
+        print("Attempt {} failed.".format(attempt))
         if attempt < max_retries:
-            print(f"Waiting {retry_delay}s before retrying...")
+            print("Waiting {}s before retrying...".format(retry_delay))
             time.sleep(retry_delay)
 
-    print(f"Download failed after {max_retries} attempts. Run again to resume.")
+    print("Download failed after {} attempts. Run again to resume.".format(max_retries))
     return False
 
 
@@ -199,7 +217,9 @@ def run_gui():
             self.downloading = True
             self.start_btn.config(state=tk.DISABLED)
             self.cancel_btn.config(state=tk.NORMAL)
-            threading.Thread(target=self.worker, args=(url, output, retries, delay), daemon=True).start()
+            worker = threading.Thread(target=self.worker, args=(url, output, retries, delay))
+            worker.daemon = True
+            worker.start()
 
         def worker(self, url, output, retries, delay):
             prepare_resume(output, log=self.write)
@@ -207,21 +227,25 @@ def run_gui():
             success = False
             while attempt < retries and self.downloading:
                 attempt += 1
-                self.write(f"Attempt {attempt}/{retries}: downloading '{output}'...")
+                self.write("Attempt {}/{}: downloading '{}'...".format(attempt, retries, output))
+                devnull = open(os.devnull, 'wb')
                 self.process = subprocess.Popen(build_wget_cmd(url, output),
-                                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                                 stdout=devnull, stderr=devnull)
                 while self.process.poll() is None and self.downloading:
                     time.sleep(0.2)
                 if not self.downloading:
                     self.process.terminate()
+                    devnull.close()
                     self.write("Download cancelled.")
                     break
                 if self.process.returncode == 0:
+                    devnull.close()
                     success = True
                     break
-                self.write(f"Attempt {attempt} failed.")
+                devnull.close()
+                self.write("Attempt {} failed.".format(attempt))
                 if attempt < retries and self.downloading:
-                    self.write(f"Waiting {delay}s before retrying...")
+                    self.write("Waiting {}s before retrying...".format(delay))
                     time.sleep(delay)
             self.root.after(0, self.finish, success, output)
 
@@ -231,8 +255,8 @@ def run_gui():
             self.cancel_btn.config(state=tk.DISABLED)
             if success:
                 size = os.path.getsize(output) if os.path.exists(output) else 0
-                self.write(f"Done. Saved to '{output}' ({size:,} bytes).")
-                messagebox.showinfo("Download complete", f"Saved to '{output}'.")
+                self.write("Done. Saved to '{}' ({} bytes).".format(output, size))
+                messagebox.showinfo("Download complete", "Saved to '{}'.".format(output))
             else:
                 self.write("Download did not complete. Run again to resume.")
 

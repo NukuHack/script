@@ -1,5 +1,5 @@
 #!/bin/sh
-set -euo pipefail
+set -eu
 
 API_URL="https://openrouter.ai/api/v1/chat/completions"
 SYSTEM_PROMPT="Reply in plain text only. Do not use Markdown, code fences, bullet symbols, or special formatting unless explicitly asked."
@@ -22,29 +22,41 @@ EOF
 AI_KEY=""
 MODEL=""
 
-while [[ $# -gt 0 ]]; do
+while [ "$#" -gt 0 ]; do
   case "$1" in
     -k|--key)
-      [[ -n "${2:-}" ]] || { usage >&2; exit 2; }
-      AI_KEY="$2"; shift 2 ;;
+      shift
+      [ "$#" -gt 0 ] || { usage >&2; exit 2; }
+      AI_KEY=$1
+      shift
+      ;;
     -m|--model)
-      [[ -n "${2:-}" ]] || { usage >&2; exit 2; }
-      MODEL="$2"; shift 2 ;;
+      shift
+      [ "$#" -gt 0 ] || { usage >&2; exit 2; }
+      MODEL=$1
+      shift
+      ;;
     -h|--help)
-      usage; exit 0 ;;
+      usage
+      exit 0
+      ;;
     --)
-      shift; break ;;
+      shift
+      break
+      ;;
     -*)
-      usage >&2; exit 2 ;;
+      usage >&2
+      exit 2
+      ;;
     *)
-      break ;;
+      break
+      ;;
   esac
 done
 
 PROMPT="$*"
 
-# Require all three. Any missing -> print help and exit.
-if [[ -z "$AI_KEY" || -z "$MODEL" || -z "$PROMPT" ]]; then
+if [ -z "$AI_KEY" ] || [ -z "$MODEL" ] || [ -z "$PROMPT" ]; then
   usage >&2
   exit 1
 fi
@@ -73,16 +85,16 @@ response=$(curl -sS "$API_URL" \
   -H "Authorization: Bearer $AI_KEY" \
   -d "$payload")
 
-if ! jq -e . >/dev/null 2>&1 <<<"$response"; then
+if ! printf '%s\n' "$response" | jq -e . >/dev/null 2>&1; then
   echo "Error: API returned a non-JSON response:" >&2
   echo "$response" >&2
   exit 1
 fi
 
-if jq -e '.error' >/dev/null 2>&1 <<<"$response"; then
+if printf '%s\n' "$response" | jq -e '.error' >/dev/null 2>&1; then
   echo "API error:" >&2
-  jq -r '.error.message // .error' <<<"$response" >&2
+  printf '%s\n' "$response" | jq -r '.error.message // .error' >&2
   exit 1
 fi
 
-jq -r '.choices[0].message.content // empty' <<<"$response"
+printf '%s\n' "$response" | jq -r '.choices[0].message.content // empty' 

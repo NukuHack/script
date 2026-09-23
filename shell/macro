@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 #
 # Unified macro script: clicks a mouse button OR presses a key, repeatedly
 # or held down, paused/resumed with Caps Lock.

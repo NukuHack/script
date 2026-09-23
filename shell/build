@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Unified check/build script for Rust projects.
 #
 # Default: native cargo pipeline (build/test/run via cargo).

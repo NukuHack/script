@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 set -euo pipefail
 
 API_URL="https://openrouter.ai/api/v1/chat/completions"

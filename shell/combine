@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 #
 # combine.sh - Combine files with a filterable expression.
 #

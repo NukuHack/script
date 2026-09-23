@@ -1,0 +1,20 @@
+#!/bin/sh
+# Invoke chat.sh sitting next to this script, loading keys relative to this script.
+
+# --- resolve our own directory, robustly ---
+self=$0
+case "$self" in
+    */*) : ;;                          # has a path component
+    *)   self=$(command -v -- "$self") # invoked via $PATH; ask the shell
+         ;;
+esac
+dir=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd) || exit 1
+
+# --- read the two key fragments (concatenated), safely ---
+key=$(cat -- "$dir/idk.txt")$(cat -- "$dir/idk2.txt")
+
+# --- exec chat.sh with everything properly quoted ---
+exec "$dir/chat.sh" \
+    -k "$key" \
+    -m 'deepseek/deepseek-chat-v3.1' \
+    "$@"

@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # simple script
 # Installs the .NET SDK into scratch space (/tmp) to dodge AFS quota limits.
 set -euo pipefail

@@ -1,0 +1,337 @@
+#!/usr/bin/env bash
+#
+# make-system-backup.sh
+#
+# Creates two archives that together document and back up the parts of a
+# Fedora (or other RPM/dnf-based) Linux system that live outside /home:
+#
+#   etc-minimal.tgz   - a curated copy of /etc (+ a few /var/lib bits)
+#   lists_tar.xz      - text inventories of packages, repos, and hardware
+#
+# Run with sudo (it needs to read root-only files like /etc/shadow and
+# NetworkManager secrets). The two output archives are chowned back to the
+# invoking (non-root) user at the end, so you never need sudo to read or
+# extract them afterwards.
+#
+#   sudo ./make-system-backup.sh [output-directory]
+#
+# See BACKUP-README.md (generated alongside the script, or from the chat)
+# for exactly what is and isn't covered, and how to restore.
+
+set -uo pipefail
+
+# ---------------------------------------------------------------------------
+# 0. Sanity checks
+# ---------------------------------------------------------------------------
+
+if [[ $EUID -ne 0 ]]; then
+  echo "ERROR: this script must be run as root (use sudo)." >&2
+  echo "It needs to read /etc/shadow, NetworkManager secrets, etc." >&2
+  exit 1
+fi
+
+# Figure out who actually invoked sudo, so we can chown the result back.
+REAL_USER="${SUDO_USER:-}"
+if [[ -z "$REAL_USER" || "$REAL_USER" == "root" ]]; then
+  REAL_USER="$(logname 2>/dev/null || true)"
+fi
+if [[ -z "$REAL_USER" ]]; then
+  echo "WARNING: could not determine the non-root user (no SUDO_USER, no logname)." >&2
+  echo "Output files will stay owned by root. Pass a user name manually if needed." >&2
+  REAL_USER="root"
+fi
+
+REAL_HOME="$(getent passwd "$REAL_USER" | cut -d: -f6)"
+REAL_UID="$(id -u "$REAL_USER")"
+REAL_GID="$(id -g "$REAL_USER")"
+[[ -z "$REAL_HOME" ]] && REAL_HOME="/root"
+
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+OUTDIR="${1:-$REAL_HOME/system-backup-$TIMESTAMP}"
+STAGE="$(mktemp -d /tmp/sysbackup.XXXXXX)"
+
+mkdir -p "$OUTDIR"
+mkdir -p "$STAGE/lists"
+
+echo "==> Staging in:        $STAGE"
+echo "==> Final output dir:  $OUTDIR"
+echo "==> Backing up for:    $REAL_USER (home: $REAL_HOME)"
+echo
+
+# Run a command as the real (non-root) user, e.g. for per-user dconf/flatpak/code.
+as_user() {
+  runuser -u "$REAL_USER" -- "$@"
+}
+
+# Run a command, writing its stdout to a file; never abort the script if the
+# tool is missing or the command fails - just note it in the output file.
+capture() {
+  local outfile="$1"; shift
+  local label="$1"; shift
+  if command -v "$1" >/dev/null 2>&1; then
+    if "$@" >"$STAGE/lists/$outfile" 2>&1; then
+      echo "    [ok]      $label -> lists/$outfile"
+    else
+      echo "    [warn]    $label ran but exited non-zero -> lists/$outfile"
+    fi
+  else
+    echo "# $1: command not found on this system" >"$STAGE/lists/$outfile"
+    echo "    [skip]    $label ($1 not installed)"
+  fi
+}
+
+capture_as_user() {
+  local outfile="$1"; shift
+  local label="$1"; shift
+  if command -v "$1" >/dev/null 2>&1; then
+    if as_user "$@" >"$STAGE/lists/$outfile" 2>&1; then
+      echo "    [ok]      $label -> lists/$outfile"
+    else
+      echo "    [warn]    $label ran but exited non-zero -> lists/$outfile"
+    fi
+  else
+    echo "# $1: command not found on this system" >"$STAGE/lists/$outfile"
+    echo "    [skip]    $label ($1 not installed)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 1. etc-minimal.tgz  -  curated /etc (+ a bit of /var/lib)
+# ---------------------------------------------------------------------------
+
+echo "==> [1/2] Building etc-minimal.tgz ..."
+
+# Paths are relative to /. Directories are grabbed whole; files individually.
+# Kept deliberately curated rather than "all of /etc" to avoid caches, machine
+# IDs that must stay unique, and other cruft that shouldn't be replayed as-is.
+ETC_PATHS=(
+  # Package management / repos
+  etc/yum.repos.d
+  etc/dnf
+
+  # Networking
+  etc/NetworkManager/system-connections
+  etc/NetworkManager/conf.d
+  etc/hosts
+  etc/hostname
+  etc/wireguard
+  etc/openvpn
+
+  # Boot / disks
+  etc/fstab
+  etc/crypttab
+  etc/default/grub
+  etc/grub.d
+
+  # Kernel / modules / sysctl
+  etc/modprobe.d
+  etc/dracut.conf.d
+  etc/modules-load.d
+  etc/sysctl.d
+
+  # Display
+  etc/X11/xorg.conf.d
+
+  # Service defaults (systemd sysconfig-style env files)
+  etc/sysconfig
+
+  # SSH client/server config (NOT host keys - see EXCLUDES below)
+  etc/ssh
+
+  # Firewall
+  etc/firewalld
+
+  # Printing / file sharing
+  etc/cups
+  etc/samba
+
+  # Certificates / trust store / signing keys
+  etc/pki
+
+  # Locale / environment
+  etc/locale.conf
+  etc/vconsole.conf
+  etc/environment
+  etc/profile.d
+
+  # Auth / access control
+  etc/pam.d
+  etc/security/limits.d
+  etc/polkit-1
+  etc/selinux/config
+  etc/sudoers
+  etc/sudoers.d
+
+  # Accounts (sensitive - see README)
+  etc/passwd
+  etc/group
+  etc/shadow
+  etc/gshadow
+  etc/subuid
+  etc/subgid
+
+  # systemd unit overrides / enabled-unit symlinks
+  etc/systemd/system
+  etc/systemd/user
+
+  # udev custom rules
+  etc/udev/rules.d
+
+  # A couple of useful /var/lib bits that aren't really "data"
+  var/lib/bluetooth
+  var/lib/AccountsService
+)
+
+# Never include actual SSH host identity keys - these should be freshly
+# generated on every install, not reused.
+EXCLUDES=(
+  --exclude='etc/ssh/ssh_host_*'
+)
+
+# Build the list of paths that actually exist right now (tar would otherwise
+# hard-fail on a path that's missing on this particular machine).
+EXISTING_PATHS=()
+MISSING_PATHS=()
+for p in "${ETC_PATHS[@]}"; do
+  if [[ -e "/$p" ]]; then
+    EXISTING_PATHS+=("$p")
+  else
+    MISSING_PATHS+=("$p")
+  fi
+done
+
+tar --create --gzip \
+    --ignore-failed-read \
+    "${EXCLUDES[@]}" \
+    --file "$STAGE/etc-minimal.tgz" \
+    -C / \
+    "${EXISTING_PATHS[@]}"
+
+echo "    tar exit code: $? (nonzero can be normal - some files vanish under you, e.g. sockets)"
+if [[ ${#MISSING_PATHS[@]} -gt 0 ]]; then
+  echo "    Skipped (not present on this system):"
+  printf '      - %s\n' "${MISSING_PATHS[@]}"
+fi
+echo "    Done: etc-minimal.tgz ($(du -h "$STAGE/etc-minimal.tgz" | cut -f1))"
+echo
+
+# ---------------------------------------------------------------------------
+# 2. lists_tar.xz  -  package / hardware / config inventories
+# ---------------------------------------------------------------------------
+
+echo "==> [2/2] Building lists_tar.xz ..."
+
+# --- Packages (dnf / rpm) ---------------------------------------------------
+if command -v dnf >/dev/null 2>&1; then
+  capture dnf-installed.txt      "all installed packages (dnf)"      dnf repoquery --installed --qf '%{name}\n'
+  capture dnf-userinstalled.txt  "explicitly-installed packages"     dnf repoquery --userinstalled --qf '%{name}\n'
+  capture dnf-groups.txt         "installed package groups"          dnf group list --installed
+  capture dnf-enabled-repos.txt  "enabled repos"                     dnf repolist --enabled
+  capture dnf-repos-all.txt      "all known repos"                   dnf repolist --all
+else
+  for f in dnf-installed.txt dnf-userinstalled.txt dnf-groups.txt dnf-enabled-repos.txt dnf-repos-all.txt; do
+    echo "# dnf not found on this system" > "$STAGE/lists/$f"
+  done
+  echo "    [skip]    dnf-based inventories (dnf not installed)"
+fi
+
+capture rpm-all.txt "full rpm -qa listing" rpm -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n'
+
+# --- Flatpak -----------------------------------------------------------------
+if command -v flatpak >/dev/null 2>&1; then
+  capture flatpak-apps.txt      "flatpak app IDs"          flatpak list --app --columns=application
+  capture flatpak-refs.txt      "flatpak refs"              flatpak list --app --columns=ref
+  capture flatpak-apps.tsv      "flatpak apps (detailed)"   flatpak list --app --columns=application,name,version,branch,origin
+  capture flatpak-runtimes.tsv  "flatpak runtimes"          flatpak list --runtime --columns=application,version,branch,origin
+  capture flatpak-remotes.txt   "flatpak remotes"           flatpak remotes
+else
+  for f in flatpak-apps.txt flatpak-refs.txt flatpak-apps.tsv flatpak-runtimes.tsv flatpak-remotes.txt; do
+    echo "# flatpak not found on this system" > "$STAGE/lists/$f"
+  done
+  echo "    [skip]    flatpak inventories (flatpak not installed)"
+fi
+
+# --- Per-user stuff (must run as the real user, not root) -------------------
+capture_as_user vscode-extensions.txt "VS Code extensions" code --list-extensions
+capture_as_user dconf.ini             "dconf settings dump" dconf dump /
+
+if [[ -n "$REAL_HOME" && -d "$REAL_HOME/.local/bin" ]]; then
+  as_user ls -la "$REAL_HOME/.local/bin" > "$STAGE/lists/local-bin.txt" 2>&1 \
+    && echo "    [ok]      ~/.local/bin listing -> lists/local-bin.txt" \
+    || echo "    [warn]    could not list ~/.local/bin"
+else
+  echo "# $REAL_HOME/.local/bin does not exist" > "$STAGE/lists/local-bin.txt"
+  echo "    [skip]    ~/.local/bin (doesn't exist)"
+fi
+
+# --- System-wide file locations ---------------------------------------------
+if [[ -d /usr/local/bin ]]; then
+  ls -la /usr/local/bin > "$STAGE/lists/usr-local-bin.txt" 2>&1
+  echo "    [ok]      /usr/local/bin listing -> lists/usr-local-bin.txt"
+else
+  echo "# /usr/local/bin does not exist" > "$STAGE/lists/usr-local-bin.txt"
+fi
+
+if [[ -d /opt ]]; then
+  ls -la /opt > "$STAGE/lists/opt.txt" 2>&1
+  echo "    [ok]      /opt listing -> lists/opt.txt"
+else
+  echo "# /opt does not exist" > "$STAGE/lists/opt.txt"
+fi
+
+{
+  find /usr/share/applications -maxdepth 1 -name '*.desktop' 2>/dev/null
+  [[ -n "$REAL_HOME" ]] && find "$REAL_HOME/.local/share/applications" -maxdepth 1 -name '*.desktop' 2>/dev/null
+} | sort > "$STAGE/lists/desktop-files.txt"
+echo "    [ok]      installed .desktop files -> lists/desktop-files.txt"
+
+# --- Hardware / block devices / drivers --------------------------------------
+capture lsblk.txt       "block devices"            lsblk -f -o NAME,FSTYPE,LABEL,UUID,MOUNTPOINT,SIZE
+capture fdisk.txt        "partition tables"         fdisk -l
+capture df.txt            "filesystem usage"         df -hT
+capture mount.txt          "active mounts"            mount
+capture swapon.txt          "active swap"               swapon --show
+capture lspci.txt            "PCI devices + drivers"     lspci -k
+capture lsusb.txt             "USB devices"                lsusb
+capture lscpu.txt              "CPU info"                   lscpu
+capture dmidecode.txt           "DMI/SMBIOS (board, BIOS)"   dmidecode
+capture nvidia-smi.txt            "NVIDIA GPU status"           nvidia-smi
+capture mok-enrolled.txt           "enrolled Secure Boot MOK keys" mokutil --list-enrolled
+
+# --- System state / identity -------------------------------------------------
+capture sestatus.txt     "SELinux status"    sestatus
+capture timedatectl.txt   "time/date/NTP config" timedatectl
+capture localectl.txt      "locale/keyboard config" localectl
+capture nmcli-connections.txt "NetworkManager connections" nmcli connection show
+
+TOTAL_LIST_FILES=$(find "$STAGE/lists" -type f | wc -l)
+echo "    Collected $TOTAL_LIST_FILES list files."
+
+tar --create --xz --file "$STAGE/lists_tar.xz" -C "$STAGE" lists
+echo "    Done: lists_tar.xz ($(du -h "$STAGE/lists_tar.xz" | cut -f1))"
+echo
+
+# ---------------------------------------------------------------------------
+# 3. Finalize: move to OUTDIR and hand ownership back to the real user
+# ---------------------------------------------------------------------------
+
+mv "$STAGE/etc-minimal.tgz" "$OUTDIR/etc-minimal.tgz"
+mv "$STAGE/lists_tar.xz"    "$OUTDIR/lists_tar.xz"
+rmdir "$STAGE/lists" 2>/dev/null || rm -rf "$STAGE/lists"
+rmdir "$STAGE" 2>/dev/null || true
+
+chown "$REAL_UID:$REAL_GID" "$OUTDIR" "$OUTDIR/etc-minimal.tgz" "$OUTDIR/lists_tar.xz" 2>/dev/null || true
+chmod 755 "$OUTDIR"
+chmod 644 "$OUTDIR/etc-minimal.tgz" "$OUTDIR/lists_tar.xz"
+
+echo "==================================================================="
+echo " Done."
+echo "   $OUTDIR/etc-minimal.tgz"
+echo "   $OUTDIR/lists_tar.xz"
+echo
+echo " Both files are owned by $REAL_USER and readable without sudo."
+echo " NOTE: etc-minimal.tgz still contains files like /etc/shadow with"
+echo " their original restrictive permissions preserved INSIDE the"
+echo " archive - that's expected. Only the archive file itself was"
+echo " opened up so you (a normal user) can copy/move/upload it."
+echo "==================================================================="

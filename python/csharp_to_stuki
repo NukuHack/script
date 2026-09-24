@@ -1,0 +1,798 @@
+#!/usr/bin/env python3
+"""
+csharp_to_stuki.py
+-------------------
+Turn C# method(s) into a shareable progalap.elte.hu/stuki structogram URL
+(?data=<gzip+base64 of the app's own Redux state>). Every method found in
+the input becomes its own structogram; they all load into the editor
+together, side by side, in one URL.
+
+Scope / honesty about limits:
+  - Standard library only, no real C# compiler/parser behind this - it's a
+    hand-rolled recursive-descent scanner tuned for typical "textbook
+    algorithm" code (loops, ifs, switches, simple decls, simple I/O).
+  - Supports: if/else if/else, while, do-while, for (desugared into an
+    init statement + pre-test while + trailing increment), foreach
+    (rendered as a pre-test loop over the header text), switch/case/default,
+    break/continue as literal statements, local variable declarations
+    pulled into the "variables" box with real C# types, and a trailing
+    top-level `return` becomes the structogram's footer instead of a body
+    statement.
+  - I/O sugar: Console.WriteLine(...)/Console.Write(...) become "out ...";
+    a bare Console.ReadLine()/Read()/ReadKey() or `x = Console.ReadLine();`
+    become "inp" / "inp x". Wrapping conversions (int.Parse(...),
+    double.TryParse(...), Convert.ToInt32(...), etc.) are stripped away as
+    pure C#-isms that add no algorithmic meaning - `int.Parse(Console.ReadLine())`
+    collapses straight to `inp x`; a `Type.TryParse(...)` call just has its
+    type-qualifier dropped (TryParse(...)) since it can't cleanly collapse
+    to one value (it has an out-parameter and a bool result).
+  - "Static" is handled the boring way: a `static` modifier on a method is
+    just one of the modifiers the signature scanner already skips over, and
+    any other static reference (Math.Sqrt(x), Console itself, a call to
+    another static helper, a static field) is not treated specially at all
+    - it is simply kept verbatim as ordinary statement/condition text,
+    which is the same fallback every unrecognized expression gets.
+  - Not supported: lambdas/LINQ, properties, try/catch, attributes,
+    nested local functions, multi-declarator statements with non-builtin
+    types (only the first initializer survives). Anything genuinely
+    unrecognized is kept as a literal statement line rather than crashing.
+
+Usage:
+  python3 csharp_to_stuki.py path/to/Program.cs
+  python3 csharp_to_stuki.py < Program.cs
+  python3 csharp_to_stuki.py            # runs a built-in demo (2 methods)
+"""
+import sys
+import re
+import json
+import gzip
+import base64
+import random
+import urllib.parse
+
+BASE62 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+
+def rand_id(n=8):
+    return "".join(random.choice(BASE62) for _ in range(n))
+
+
+def strip_comments(src):
+    """Remove // line comments and /* */ block comments (string/char aware)."""
+    out = []
+    i, n = 0, len(src)
+    in_str = in_chr = False
+    while i < n:
+        c = src[i]
+        if not in_str and not in_chr and c == "/" and i + 1 < n and src[i + 1] == "/":
+            j = src.find("\n", i)
+            i = n if j == -1 else j
+            continue
+        if not in_str and not in_chr and c == "/" and i + 1 < n and src[i + 1] == "*":
+            j = src.find("*/", i + 2)
+            i = n if j == -1 else j + 2
+            continue
+        if not in_chr and c == '"':
+            in_str = not in_str
+        elif not in_str and c == "'":
+            in_chr = not in_chr
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def find_matching(s, open_idx):
+    """s[open_idx] is one of ( [ { -- return index of its match, string/char aware."""
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    open_ch = s[open_idx]
+    close_ch = pairs[open_ch]
+    depth = 0
+    i = open_idx
+    in_str = in_chr = False
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if in_str:
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+        elif in_chr:
+            if c == "\\":
+                i += 2
+                continue
+            if c == "'":
+                in_chr = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c == "'":
+                in_chr = True
+            elif c == open_ch:
+                depth += 1
+            elif c == close_ch:
+                depth -= 1
+                if depth == 0:
+                    return i
+        i += 1
+    raise ValueError(f"Unbalanced {open_ch!r} starting at {open_idx}")
+
+
+def find_stmt_end(s, i, limit):
+    """Index of the ';' terminating the statement starting at i (depth/string aware)."""
+    depth = 0
+    in_str = in_chr = False
+    j = i
+    while j < limit:
+        c = s[j]
+        if in_str:
+            if c == "\\":
+                j += 2
+                continue
+            if c == '"':
+                in_str = False
+        elif in_chr:
+            if c == "\\":
+                j += 2
+                continue
+            if c == "'":
+                in_chr = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c == "'":
+                in_chr = True
+            elif c in "([{":
+                depth += 1
+            elif c in ")]}":
+                depth -= 1
+            elif c == ";" and depth == 0:
+                return j
+        j += 1
+    return limit
+
+
+def split_top_level(s, sep):
+    parts, depth, start = [], 0, 0
+    in_str = in_chr = False
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if in_str:
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+        elif in_chr:
+            if c == "\\":
+                i += 2
+                continue
+            if c == "'":
+                in_chr = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c == "'":
+                in_chr = True
+            elif c in "([{":
+                depth += 1
+            elif c in ")]}":
+                depth -= 1
+            elif c == sep and depth == 0:
+                parts.append(s[start:i])
+                start = i + 1
+        i += 1
+    parts.append(s[start:])
+    return parts
+
+
+def skip_ws(s, i, limit):
+    while i < limit and s[i] in " \t\r\n":
+        i += 1
+    return i
+
+
+IDENT_RE = re.compile(r"[A-Za-z_]\w*")
+
+METHOD_SIG_RE = re.compile(
+    r"(?:public|private|protected|internal|static|virtual|override|sealed|abstract|async|unsafe|extern|new|partial|\s)*"
+    r"([\w\.\<\>\[\],\s]+?)\s+(\w+)\s*\("
+)
+
+
+def peek_word(s, i):
+    m = IDENT_RE.match(s, i)
+    return m.group(0) if m else None
+
+
+def match_word(s, i, word):
+    return s[i:i + len(word)] == word and (
+        i + len(word) >= len(s) or not (s[i + len(word)].isalnum() or s[i + len(word)] == "_")
+    )
+
+
+# ---------------------------------------------------------------------------
+# I/O + conversion-call simplification
+#   Console.WriteLine/Write        -> "out ..."
+#   Console.ReadLine/Read/ReadKey  -> "inp" / "inp <target>"
+#   TypeName.Parse(x) / Convert.ToXxx(x) -> x  (unwrapped, recursively)
+#   TypeName.TryParse(...)         -> TryParse(...)  (qualifier dropped only)
+#   ref/out/in parameter modifiers -> dropped (cosmetic)
+# ---------------------------------------------------------------------------
+
+BUILTIN_NUMERIC = r"(?:int|uint|long|ulong|short|ushort|byte|sbyte|double|float|decimal|bool|char)"
+PARSE_WRAPPER_RE = re.compile(
+    rf"\b{BUILTIN_NUMERIC}\.Parse\s*\("
+    r"|\bConvert\.To(?:Int32|Int64|Int16|Byte|SByte|UInt32|UInt64|UInt16|Double|Single|Decimal|Boolean|Char|String)\s*\("
+)
+TRYPARSE_QUALIFIER_RE = re.compile(rf"\b{BUILTIN_NUMERIC}\.TryParse\b")
+REF_OUT_IN_RE = re.compile(r"\b(?:ref|out|in)\s+(?=[A-Za-z_])")
+CONSOLE_WRITE_RE = re.compile(r"^Console(?:\.Out|\.Error)?\.(WriteLine|Write)\s*\(")
+CONSOLE_READ_RE = re.compile(r"^Console\.(ReadLine|Read|ReadKey)\s*\(")
+ASSIGN_RE = re.compile(r"^([A-Za-z_]\w*(?:\[[^\]]*\])?)\s*=\s*(.+)$", re.S)
+
+
+def strip_parse_wrappers(text):
+    guard = 0
+    while guard < 25:
+        m = PARSE_WRAPPER_RE.search(text)
+        if not m:
+            break
+        open_paren = text.index("(", m.start())
+        try:
+            close_paren = find_matching(text, open_paren)
+        except ValueError:
+            break
+        inner = text[open_paren + 1:close_paren].strip()
+        text = text[:m.start()] + inner + text[close_paren + 1:]
+        guard += 1
+    return text
+
+
+def simplify_generic(text):
+    """Applies to BOTH statement text and condition text."""
+    text = strip_parse_wrappers(text)
+    text = TRYPARSE_QUALIFIER_RE.sub("TryParse", text)
+    text = REF_OUT_IN_RE.sub("", text)
+    return text.strip()
+
+
+def _whole_call_span(text, m):
+    """Given a regex match at the start of text for `Name(`, return (open, close)
+    of that call's parens if the call spans to the end of (trimmed) text, else None."""
+    open_paren = text.index("(", m.start())
+    try:
+        close_paren = find_matching(text, open_paren)
+    except ValueError:
+        return None
+    if close_paren == len(text.rstrip()) - 1:
+        return open_paren, close_paren
+    return None
+
+
+def simplify_stmt(text):
+    """Statement-only simplification: whole-statement Console I/O -> inp/out."""
+    text = text.strip()
+
+    m = CONSOLE_WRITE_RE.match(text)
+    if m:
+        span = _whole_call_span(text, m)
+        if span:
+            inner = simplify_generic(text[span[0] + 1:span[1]].strip())
+            return f"out {inner}" if inner else "out"
+
+    m = CONSOLE_READ_RE.match(text)
+    if m and _whole_call_span(text, m):
+        return "inp"
+
+    simplified = simplify_generic(text)
+
+    m = ASSIGN_RE.match(simplified)
+    if m:
+        target, rhs = m.group(1), m.group(2).strip()
+        m2 = CONSOLE_READ_RE.match(rhs)
+        if m2 and _whole_call_span(rhs, m2):
+            return f"inp {target}"
+
+    return simplified
+
+
+def simplify_cond(text):
+    return simplify_generic(text.strip())
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: scan C# source -> lightweight python AST (per method)
+# ---------------------------------------------------------------------------
+
+class MethodBodyParser:
+    """Parses ONE method body (statements only - the signature has already
+    been located by find_all_methods)."""
+
+    def __init__(self):
+        self.variables = []       # "name : Type" strings, in declared order
+        self.pending_return = None
+
+    def parse_params(self, params_str):
+        for p in split_top_level(params_str, ","):
+            p = p.strip()
+            if not p:
+                continue
+            p = re.sub(r"^(ref|out|in|params)\s+", "", p)
+            if "=" in p:
+                p = p.split("=", 1)[0].strip()
+            tokens = p.rsplit(None, 1)
+            if len(tokens) == 2:
+                typ, name = tokens
+            else:
+                typ, name = "var", tokens[0]
+            self.variables.append(f"{name.strip()} : {typ.strip()}")
+
+    def parse_statements(self, s, i, limit, top_level=False):
+        items = []
+        pos = i
+        while True:
+            pos = skip_ws(s, pos, limit)
+            if pos >= limit:
+                break
+            new_items, pos = self.parse_one_statement(s, pos, limit, top_level)
+            items.extend(new_items)
+        return items
+
+    def parse_body(self, s, pos, limit):
+        pos = skip_ws(s, pos, limit)
+        if pos < limit and s[pos] == "{":
+            close = find_matching(s, pos)
+            items = self.parse_statements(s, pos + 1, close)
+            return items, close + 1
+        return self.parse_one_statement(s, pos, limit, top_level=False)
+
+    def parse_one_statement(self, s, pos, limit, top_level):
+        word = peek_word(s, pos)
+        if word == "if":
+            node, pos2 = self.parse_if(s, pos, limit)
+            return [node], pos2
+        if word == "while":
+            node, pos2 = self.parse_while(s, pos, limit)
+            return [node], pos2
+        if word == "do":
+            node, pos2 = self.parse_do_while(s, pos, limit)
+            return [node], pos2
+        if word == "for":
+            nodes_list, pos2 = self.parse_for(s, pos, limit)
+            return nodes_list, pos2
+        if word == "foreach":
+            node, pos2 = self.parse_foreach(s, pos, limit)
+            return [node], pos2
+        if word == "switch":
+            node, pos2 = self.parse_switch(s, pos, limit)
+            return [node], pos2
+        if s[pos] == "{":
+            close = find_matching(s, pos)
+            return self.parse_statements(s, pos + 1, close), close + 1
+        if word in ("break", "continue"):
+            semi = find_stmt_end(s, pos, limit)
+            return [{"kind": "stmt", "text": s[pos:semi].strip()}], semi + 1
+        if word == "return":
+            semi = find_stmt_end(s, pos, limit)
+            expr = simplify_generic(s[pos + 6:semi].strip()) if s[pos + 6:semi].strip() else ""
+            new_pos = semi + 1
+            if top_level and s[new_pos:limit].strip() == "":
+                self.pending_return = expr
+                return [], new_pos
+            text = f"return {expr}" if expr else "return"
+            return [{"kind": "stmt", "text": text}], new_pos
+        # plain statement / declaration
+        semi = find_stmt_end(s, pos, limit)
+        raw = s[pos:semi].strip()
+        new_pos = semi + 1
+        if raw == "":
+            return [], new_pos
+        decl_items, is_decl = self.try_parse_declaration(raw)
+        if is_decl:
+            return decl_items, new_pos
+        return [{"kind": "stmt", "text": simplify_stmt(raw)}], new_pos
+
+    def try_parse_declaration(self, raw):
+        m = re.match(
+            r"^(var|bool|byte|sbyte|char|decimal|double|float|int|uint|long|ulong|short|ushort|string|object|dynamic)\s+(.+)$",
+            raw,
+        )
+        if not m:
+            m = re.match(r"^([A-Za-z_]\w*(?:<[^=;]+>)?(?:\[\s*\])?)\s+([A-Za-z_]\w*\s*(?:=.*)?)$", raw)
+        if not m:
+            return [], False
+        typ, rest = m.group(1), m.group(2)
+        items = []
+        any_valid = False
+        for d in split_top_level(rest, ","):
+            d = d.strip()
+            if not d:
+                continue
+            if "=" in d:
+                name, expr = (p.strip() for p in d.split("=", 1))
+            else:
+                name, expr = d, None
+            if not re.match(r"^[A-Za-z_]\w*$", name):
+                return [], False
+            any_valid = True
+            self.variables.append(f"{name} : {typ}")
+            if expr is not None:
+                items.append({"kind": "stmt", "text": simplify_stmt(f"{name} = {expr}")})
+        return (items, True) if any_valid else ([], False)
+
+    def parse_if(self, s, pos, limit):
+        pos += 2
+        pos = skip_ws(s, pos, limit)
+        close_paren = find_matching(s, pos)
+        cond = simplify_cond(s[pos + 1:close_paren].strip())
+        pos = skip_ws(s, close_paren + 1, limit)
+        true_items, pos = self.parse_body(s, pos, limit)
+        pos2 = skip_ws(s, pos, limit)
+        false_items = []
+        if match_word(s, pos2, "else"):
+            pos3 = skip_ws(s, pos2 + 4, limit)
+            if match_word(s, pos3, "if"):
+                nested, pos = self.parse_if(s, pos3, limit)
+                false_items = [nested]
+            else:
+                false_items, pos = self.parse_body(s, pos3, limit)
+        node = {
+            "kind": "if", "cond": cond,
+            "true": {"kind": "seq", "items": true_items},
+            "false": {"kind": "seq", "items": false_items},
+        }
+        return node, pos
+
+    def parse_while(self, s, pos, limit):
+        pos += 5
+        pos = skip_ws(s, pos, limit)
+        close_paren = find_matching(s, pos)
+        cond = simplify_cond(s[pos + 1:close_paren].strip())
+        pos = skip_ws(s, close_paren + 1, limit)
+        items, pos = self.parse_body(s, pos, limit)
+        return {"kind": "while", "cond": cond, "body": {"kind": "seq", "items": items}}, pos
+
+    def parse_do_while(self, s, pos, limit):
+        pos += 2
+        items, pos = self.parse_body(s, pos, limit)
+        pos = skip_ws(s, pos, limit)
+        assert match_word(s, pos, "while"), "expected 'while' after do-block"
+        pos = skip_ws(s, pos + 5, limit)
+        close_paren = find_matching(s, pos)
+        cond = simplify_cond(s[pos + 1:close_paren].strip())
+        pos = skip_ws(s, close_paren + 1, limit)
+        if pos < limit and s[pos] == ";":
+            pos += 1
+        return {"kind": "repeat", "cond": cond, "body": {"kind": "seq", "items": items}}, pos
+
+    def parse_for(self, s, pos, limit):
+        pos += 3
+        pos = skip_ws(s, pos, limit)
+        close_paren = find_matching(s, pos)
+        header = s[pos + 1:close_paren]
+        parts = [p.strip() for p in split_top_level(header, ";")]
+        while len(parts) < 3:
+            parts.append("")
+        init_text, cond_text, incr_text = parts[0], parts[1], parts[2]
+        pos = skip_ws(s, close_paren + 1, limit)
+        body_items, pos = self.parse_body(s, pos, limit)
+
+        result = []
+        if init_text:
+            decl_items, is_decl = self.try_parse_declaration(init_text)
+            result.extend(decl_items if is_decl else [{"kind": "stmt", "text": simplify_stmt(init_text)}])
+        loop_items = list(body_items)
+        if incr_text:
+            loop_items.append({"kind": "stmt", "text": simplify_stmt(incr_text)})
+        result.append({
+            "kind": "while", "cond": simplify_cond(cond_text) if cond_text else "true",
+            "body": {"kind": "seq", "items": loop_items},
+        })
+        return result, pos
+
+    def parse_foreach(self, s, pos, limit):
+        pos += 7
+        pos = skip_ws(s, pos, limit)
+        close_paren = find_matching(s, pos)
+        header = simplify_cond(s[pos + 1:close_paren].strip())
+        pos = skip_ws(s, close_paren + 1, limit)
+        items, pos = self.parse_body(s, pos, limit)
+        return {"kind": "while", "cond": header, "body": {"kind": "seq", "items": items}}, pos
+
+    def parse_switch(self, s, pos, limit):
+        pos += 6
+        pos = skip_ws(s, pos, limit)
+        close_paren = find_matching(s, pos)
+        expr = simplify_generic(s[pos + 1:close_paren].strip())
+        pos = skip_ws(s, close_paren + 1, limit)
+        assert s[pos] == "{", "expected '{' after switch(...)"
+        close_brace = find_matching(s, pos)
+        raw_cases = self.parse_switch_body(s, pos + 1, close_brace)
+        cases = []
+        for c in raw_cases:
+            cond = f"{expr} == {c['cond']}" if c["type"] == "case" else None
+            cases.append({"type": c["type"], "cond": cond, "body": {"kind": "seq", "items": c["items"]}})
+        return {"kind": "switch", "cases": cases}, close_brace + 1
+
+    def parse_switch_body(self, s, i, limit):
+        cases = []
+        pending = []
+        current_items = []
+
+        def flush():
+            if not pending:
+                return
+            if any(t == "default" for t, _ in pending):
+                cases.append({"type": "default", "cond": None, "items": current_items[:]})
+            else:
+                cond = " or ".join(c for _, c in pending)
+                cases.append({"type": "case", "cond": cond, "items": current_items[:]})
+            pending.clear()
+            current_items.clear()
+
+        pos = i
+        while True:
+            pos = skip_ws(s, pos, limit)
+            if pos >= limit:
+                break
+            if match_word(s, pos, "case"):
+                if current_items:
+                    flush()
+                pos = skip_ws(s, pos + 4, limit)
+                colon = pos
+                depth = 0
+                while colon < limit and not (s[colon] == ":" and depth == 0):
+                    if s[colon] in "([{":
+                        depth += 1
+                    elif s[colon] in ")]}":
+                        depth -= 1
+                    colon += 1
+                cond = s[pos:colon].strip()
+                pos = colon + 1
+                pending.append(("case", cond))
+                continue
+            if match_word(s, pos, "default"):
+                if current_items:
+                    flush()
+                pos = skip_ws(s, pos + 7, limit)
+                assert s[pos] == ":", "expected ':' after default"
+                pos += 1
+                pending.append(("default", None))
+                continue
+            new_items, pos = self.parse_one_statement(s, pos, limit, top_level=False)
+            current_items.extend(new_items)
+        flush()
+        for c in cases:
+            if c["items"] and c["items"][-1]["kind"] == "stmt" and c["items"][-1]["text"].strip() == "break":
+                c["items"].pop()
+        return cases
+
+
+# ---------------------------------------------------------------------------
+# Find every method in the source (class wrapper, multiple methods, static
+# modifiers -- all just fall out of scanning for "modifiers* TYPE NAME(" that
+# is actually followed by a real '{' body, skipping anything that isn't).
+# ---------------------------------------------------------------------------
+
+def find_all_methods(src):
+    """Returns list of (name, params_str, body_start, body_end)."""
+    results = []
+    pos = 0
+    n = len(src)
+    while True:
+        m = METHOD_SIG_RE.search(src, pos)
+        if not m:
+            break
+        name = m.group(2)
+        paren_open = m.end() - 1
+        try:
+            paren_close = find_matching(src, paren_open)
+        except ValueError:
+            pos = m.end()
+            continue
+        after = skip_ws(src, paren_close + 1, n)
+        # skip a trailing generic constraint clause, e.g. `where T : struct`
+        while src[after:after + 5] == "where":
+            brace_idx = src.find("{", after)
+            semi_idx = src.find(";", after)
+            if brace_idx == -1:
+                after = n
+                break
+            if semi_idx != -1 and semi_idx < brace_idx:
+                after = n
+                break
+            after = brace_idx
+            break
+        if after < n and src[after] == "{":
+            body_open = after
+            body_close = find_matching(src, body_open)
+            results.append((name, src[paren_open + 1:paren_close], body_open + 1, body_close))
+            pos = body_close + 1
+        else:
+            # interface/abstract signature (ends with ';'), property, delegate, etc. - skip it
+            pos = m.end()
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: python AST -> the app's own flat node-map format
+# ---------------------------------------------------------------------------
+
+class NodeBuilder:
+    def __init__(self):
+        self.nodes = {}
+
+    @staticmethod
+    def esc(text):
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def add_noop(self, parent):
+        nid = rand_id()
+        self.nodes[nid] = {"id": nid, "parentId": parent, "hidden": False, "type": "noop"}
+        return nid
+
+    def build_seq(self, parent_id, seq_ast):
+        nid = rand_id()
+        items = seq_ast["items"]
+        child_ids = [self.add_noop(nid)] if not items else [self.build_node(nid, it) for it in items]
+        self.nodes[nid] = {"id": nid, "parentId": parent_id, "hidden": False, "type": "sequence", "childrenIds": child_ids}
+        return nid
+
+    def build_node(self, parent_id, ast):
+        k = ast["kind"]
+        if k == "stmt":
+            nid = rand_id()
+            self.nodes[nid] = {"id": nid, "parentId": parent_id, "hidden": False, "type": "statement", "text": self.esc(ast["text"])}
+            return nid
+        if k == "if":
+            nid = rand_id()
+            true_id = self.build_seq(nid, ast["true"])
+            false_id = self.build_seq(nid, ast["false"])
+            self.nodes[nid] = {"id": nid, "parentId": parent_id, "hidden": False, "type": "if",
+                                "condition": self.esc(ast["cond"]),
+                                "trueBranchSequenceId": true_id, "falseBranchSequenceId": false_id}
+            return nid
+        if k == "while":
+            nid = rand_id()
+            body_id = self.build_seq(nid, ast["body"])
+            self.nodes[nid] = {"id": nid, "parentId": parent_id, "hidden": False, "type": "while",
+                                "condition": self.esc(ast["cond"]), "bodySequenceId": body_id}
+            return nid
+        if k == "repeat":
+            nid = rand_id()
+            body_id = self.build_seq(nid, ast["body"])
+            self.nodes[nid] = {"id": nid, "parentId": parent_id, "hidden": False, "type": "repeat",
+                                "condition": self.esc(ast["cond"]), "bodySequenceId": body_id}
+            return nid
+        if k == "switch":
+            nid = rand_id()
+            case_list = []
+            for c in ast["cases"]:
+                cid = rand_id()
+                body_id = self.build_seq(nid, c["body"])
+                entry = {"id": cid, "type": c["type"], "bodySequenceId": body_id}
+                if c["type"] == "case":
+                    entry["condition"] = self.esc(c["cond"])
+                case_list.append(entry)
+            self.nodes[nid] = {"id": nid, "parentId": parent_id, "hidden": False, "type": "switch", "cases": case_list}
+            return nid
+        raise ValueError(f"unknown ast kind {k!r}")
+
+
+# ---------------------------------------------------------------------------
+# Assembly: full app state (possibly many structograms) + gzip/base64/url
+# ---------------------------------------------------------------------------
+
+DEFAULT_COLORS = {
+    "text": ["#ff0000", "#0000ff", "#ffc000", "#00b050", "#00b0f0", "#7030a0", "#ceaf87"],
+    "textBackground": ["#ffb2b2", "#b2b2ff", "#ffecb2", "#b2e7ca", "#b2e7fa", "#d4c0e2"],
+    "nodeBackground": ["#ffcccc", "#ccccff", "#fff2cc", "#ccefdc", "#b2e7fa", "#d4c0e2"],
+    "structogramBackground": ["#ffffff", "#ffcccc", "#ccccff", "#fff2cc", "#ccefdc", "#ff99ff", "#008c95", "#eee4d6", "#ceaf87"],
+}
+
+
+def variables_to_html(vars_list):
+    if not vars_list:
+        return ""
+    esc = NodeBuilder.esc
+    first, rest = vars_list[0], vars_list[1:]
+    html = esc(first)
+    for v in rest:
+        html += f"<div>{esc(v)}</div>"
+    return html
+
+
+def csharp_source_to_state(source):
+    src = strip_comments(source)
+    methods = find_all_methods(src)
+    if not methods:
+        raise ValueError("Could not locate any method signature (Type Name(...) {...}) in the input")
+
+    builder = NodeBuilder()
+    structograms = []
+    for name, params_str, body_start, body_end in methods:
+        mp = MethodBodyParser()
+        mp.parse_params(params_str)
+        body_items = mp.parse_statements(src, body_start, body_end, top_level=True)
+        root_id = builder.build_seq(None, {"kind": "seq", "items": body_items})
+        structograms.append({
+            "name": name,
+            "returnText": NodeBuilder.esc(mp.pending_return) if mp.pending_return is not None else "",
+            "variables": variables_to_html(mp.variables),
+            "rootId": root_id,
+            "showVariables": bool(mp.variables),
+            "showHeader": True,
+            "showReturnText": mp.pending_return is not None,
+        })
+
+    state = {
+        "id": str(random.random()),
+        "hoverId": None,
+        "selectedId": None,
+        "nodes": builder.nodes,
+        "structograms": structograms,
+        "colors": DEFAULT_COLORS,
+    }
+    return state
+
+
+def state_to_url(state, base="https://progalap.elte.hu/stuki/v1/"):
+    json_str = json.dumps(state, separators=(",", ":"))
+    gz = gzip.compress(json_str.encode("utf-8"), mtime=0)
+    b64 = base64.b64encode(gz).decode("ascii")
+    encoded = urllib.parse.quote(b64, safe="")
+    return base + "?data=" + encoded
+
+
+def csharp_source_to_url(source):
+    state = csharp_source_to_state(source)
+    return state_to_url(state), state
+
+
+DEMO_SOURCE = """
+public class Program
+{
+    public static void Main(string[] args)
+    {
+        Console.WriteLine("Enter n:");
+        int n = int.Parse(Console.ReadLine());
+        Console.WriteLine(Fibonacci(n));
+    }
+
+    public static int Fibonacci(int n)
+    {
+        int a = 0;
+        int b = 1;
+        for (int i = 0; i < n; i++)
+        {
+            int tmp = a + b;
+            a = b;
+            b = tmp;
+        }
+        return a;
+    }
+}
+"""
+
+
+def main():
+    if len(sys.argv) > 1:
+        with open(sys.argv[1], "r", encoding="utf-8") as f:
+            source = f.read()
+    elif not sys.stdin.isatty():
+        source = sys.stdin.read()
+    else:
+        source = DEMO_SOURCE
+        print("(no input given, using built-in demo: Main + Fibonacci)\n", file=sys.stderr)
+
+    url, state = csharp_source_to_url(source)
+    print(f"parsed {len(state['structograms'])} method(s): "
+          + ", ".join(sg["name"] for sg in state["structograms"]), file=sys.stderr)
+    print(url)
+
+
+if __name__ == "__main__":
+    main()

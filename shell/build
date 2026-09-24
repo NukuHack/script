@@ -13,7 +13,17 @@
 #           "ready to run in release" hint (WASM can't be executed directly)
 #   --web   Use the WASM pipeline (wasm-pack) instead of the native cargo one
 #   -h      Show this help
-set -euo pipefail
+
+# ── Prefer bash when available (gives us pipefail); fall back to POSIX sh ──
+if [ -z "${BASH_VERSION:-}" ] && command -v bash >/dev/null 2>&1; then
+  exec bash "$0" "$@"
+fi
+
+set -eu
+# pipefail is bash-only; enable it when we actually have it.
+if [ -n "${BASH_VERSION:-}" ]; then
+  set -o pipefail
+fi
 
 # ── Config ──
 MAX_LINE_WIDTH=150
@@ -42,7 +52,7 @@ EOF
 }
 
 # ── Parse flags ──
-while [[ $# -gt 0 ]]; do
+while [ $# -gt 0 ]; do
   case "$1" in
     -y) RUN_ALL=true; RUN_MIRI=true; shift ;;
     -c) RUN_ALL=true; shift ;;
@@ -61,7 +71,7 @@ if ! $RUN_ALL && ! $SKIP_ALL && ! $QUICK; then
 fi
 
 # ── Sanity: must be a Rust (Cargo) project ──
-if [[ ! -f Cargo.toml ]]; then
+if [ ! -f Cargo.toml ]; then
   echo "ERROR: Cargo.toml not found in $(pwd)."
   echo "       Run this script from the root of a Rust (Cargo) project."
   exit 1
@@ -78,7 +88,7 @@ if $WEB_BUILD; then
 fi
 
 # ── Ensure rustfmt.toml exists with our preferred config ──
-if [[ ! -f "$RUSTFMT_TOML" ]]; then
+if [ ! -f "$RUSTFMT_TOML" ]; then
   echo "==> Creating $RUSTFMT_TOML"
   cat > "$RUSTFMT_TOML" <<'EOF'
 # Stable rustfmt configuration
@@ -100,7 +110,6 @@ fi
 if $SKIP_ALL; then
   echo "==> Skipping all checks and tests (-n flag)."
 else
-  # Formatting and linting (skip for quick mode)
   if ! $QUICK; then
     echo "==> Running cargo fmt"
     cargo fmt --all
@@ -109,9 +118,9 @@ else
     cargo clippy --all-targets -- -D warnings
 
     echo "==> Checking file and line length (warnings only)"
-    while IFS= read -r file; do
+    find . -type f -name "*.rs" ! -path "./target/*" | while IFS= read -r file; do
       total_lines=$(wc -l < "$file")
-      if (( total_lines > MAX_FILE_LINES )); then
+      if [ "$total_lines" -gt "$MAX_FILE_LINES" ]; then
         echo "WARN: $file has $total_lines lines (limit: $MAX_FILE_LINES) — consider splitting into submodules"
       fi
       awk -v file="$file" -v max="$MAX_LINE_WIDTH" '
@@ -119,27 +128,25 @@ else
           printf "WARN: %s:%d exceeds %d chars (%d)\n", file, NR, max, length($0)
         }
       ' "$file"
-    done < <(find . -type f -name "*.rs" -not -path "./target/*")
+    done
   fi
 
-  # Quick mode: unit tests only. Full mode (-y/-r) runs the whole suite below.
   if ! $RUN_ALL; then
     echo "==> Running pure-logic tests (cargo test --lib)..."
     set +e
     cargo test --lib
     LIB_TEST_STATUS=$?
     set -e
-    (( LIB_TEST_STATUS == 0 )) || echo "==> WARNING: pure-logic tests failed (exit $LIB_TEST_STATUS). Continuing anyway."
+    [ "$LIB_TEST_STATUS" -eq 0 ] || echo "==> WARNING: pure-logic tests failed (exit $LIB_TEST_STATUS). Continuing anyway."
   fi
 
-  # Full test suite (+ DOM tests when --web) (+ Miri unless -c)
   if $RUN_ALL; then
     echo "==> Running all tests (unit, integration, docs)..."
     set +e
     cargo test
     ALL_TEST_STATUS=$?
     set -e
-    (( ALL_TEST_STATUS == 0 )) || echo "==> WARNING: full test suite failed (exit $ALL_TEST_STATUS). Continuing anyway."
+    [ "$ALL_TEST_STATUS" -eq 0 ] || echo "==> WARNING: full test suite failed (exit $ALL_TEST_STATUS). Continuing anyway."
 
     if $WEB_BUILD; then
       echo "==> Running DOM-backed tests (wasm-pack test --headless --firefox)..."
@@ -147,7 +154,7 @@ else
       wasm-pack test --headless --firefox
       WASM_TEST_STATUS=$?
       set -e
-      if (( WASM_TEST_STATUS != 0 )); then
+      if [ "$WASM_TEST_STATUS" -ne 0 ]; then
         echo "==> WARNING: DOM-backed tests failed or the browser driver could not run (exit $WASM_TEST_STATUS)."
         echo "    Continuing to build anyway."
       fi
@@ -156,8 +163,6 @@ else
     if $RUN_MIRI; then
       if command -v cargo-miri >/dev/null 2>&1 || cargo +nightly miri --version >/dev/null 2>&1; then
         echo "==> Running cargo miri test --lib"
-        # Native: -Zmiri-disable-isolation lets fs-backed tests run.
-        # Web: keep the same flag for symmetry; harmless either way.
         if ! MIRIFLAGS="-Zmiri-disable-isolation" cargo +nightly miri test --lib; then
           echo "WARN: cargo miri test --lib failed or found UB — investigate before trusting unsafe code"
         fi
@@ -193,3 +198,4 @@ if $READY_TO_RUN; then
     cargo run --release
   fi
 fi
+

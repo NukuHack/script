@@ -1,17 +1,17 @@
 #!/bin/sh
-# Local CI-safe fork of the upstream build script from NukuHack/script.
+# Local fork of the upstream build script from NukuHack/script.
 #
 # Keep the same CLI contract as the original script (`-y`, `-c`, `-n`, `-q`, `-r`,
-# `--web`) while preventing the duplicate full-suite runs that make the GitHub
-# Actions job extremely slow when the browser/web path is enabled.
+# `--web`). CI runs the full suite every time, same as a local run: native
+# tests, the wasm-pack browser suite, and Miri all run on `--web` builds too,
+# with no CI-mode shortcuts.
 #
-# Compatibility note: the original script intentionally supports both POSIX sh
-# and bash. This version preserves that behavior and uses bash only when it is
-# already available in the current environment.
-
-if [ -z "${BASH_VERSION:-}" ] && command -v bash >/dev/null 2>&1; then
-	exec bash "$0" "$@"
-fi
+# Compatibility note: this script is written in plain POSIX sh (no bashisms,
+# no `pipefail`, no arrays, no `local`) and is tested under dash, sh and bash.
+# The only place the original relied on a pipeline (`find | while read`) has
+# been rewritten to go through a temp file instead, so a failing `find` still
+# aborts the script under `set -e` even without `pipefail`. When run under
+# bash we still turn `pipefail` on as a harmless extra safety net.
 
 set -eu
 if [ -n "${BASH_VERSION:-}" ]; then
@@ -29,6 +29,13 @@ RUN_MIRI=false
 READY_TO_RUN=false
 WEB_BUILD=false
 
+TMP_RS_FILES=""
+cleanup() {
+	[ -n "$TMP_RS_FILES" ] && rm -f "$TMP_RS_FILES"
+	return 0
+}
+trap cleanup EXIT INT TERM
+
 usage() {
 	cat <<'EOF'
 Usage: $0 [-y | -c | -n | -q | -r] [--web]
@@ -43,52 +50,76 @@ Usage: $0 [-y | -c | -n | -q | -r] [--web]
 EOF
 }
 
-while [ $# -gt 0 ]; do
-	case "$1" in
-		-y) RUN_ALL=true; RUN_MIRI=true; shift ;;
-		-c) RUN_ALL=true; shift ;;
-		-n) SKIP_ALL=true; shift ;;
-		-q) QUICK=true; shift ;;
-		-r) RUN_ALL=true; RUN_MIRI=true; READY_TO_RUN=true; shift ;;
-		--web) WEB_BUILD=true; shift ;;
-		-h|--help) usage; exit 0 ;;
-		*) usage; exit 1 ;;
-	esac
-done
-
-if ! $RUN_ALL && ! $SKIP_ALL && ! $QUICK; then
-	usage
-	exit 1
-fi
-
-if [ ! -f Cargo.toml ]; then
-	echo "ERROR: Cargo.toml not found in $(pwd)."
-	echo "       Run this script from the root of a Rust (Cargo) project."
-	exit 1
-fi
-
-echo "==> Checking prerequisites..."
-command -v cargo >/dev/null || {
-	echo "ERROR: cargo not found. Install from https://rustup.rs"
-	exit 1
-}
-command -v rustup >/dev/null || {
-	echo "ERROR: rustup not found. Install from https://rustup.rs"
-	exit 1
+# run_tolerant <description> <cmd> [args...]
+# Runs a command; on non-zero exit, prints a WARNING with the description and
+# exit code but does not abort the script (even under `set -e`), and always
+# returns 0. This is the "keep going, just warn" pattern the original script
+# repeated three times with a manual set +e / set -e dance.
+run_tolerant() {
+	_rt_desc=$1
+	shift
+	_rt_status=0
+	"$@" || _rt_status=$?
+	if [ "$_rt_status" -ne 0 ]; then
+		echo "==> WARNING: $_rt_desc (exit $_rt_status). Continuing anyway."
+	fi
+	return 0
 }
 
-if $WEB_BUILD; then
-	command -v wasm-pack >/dev/null || {
-		echo "INFO: Installing wasm-pack..."
-		cargo install wasm-pack
+# require_cmd <cmd> <hint>
+require_cmd() {
+	command -v "$1" >/dev/null 2>&1 || {
+		echo "ERROR: $1 not found. $2"
+		exit 1
 	}
-	echo "==> Adding wasm32 target..."
-	rustup target add wasm32-unknown-unknown
-fi
+}
 
-if [ ! -f "$RUSTFMT_TOML" ]; then
-	echo "==> Creating $RUSTFMT_TOML"
-	cat > "$RUSTFMT_TOML" <<'EOF2'
+parse_args() {
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-y) RUN_ALL=true; RUN_MIRI=true ;;
+			-c) RUN_ALL=true ;;
+			-n) SKIP_ALL=true ;;
+			-q) QUICK=true ;;
+			-r) RUN_ALL=true; RUN_MIRI=true; READY_TO_RUN=true ;;
+			--web) WEB_BUILD=true ;;
+			-h|--help) usage; exit 0 ;;
+			*) usage; exit 1 ;;
+		esac
+		shift
+	done
+
+	if ! $RUN_ALL && ! $SKIP_ALL && ! $QUICK; then
+		usage
+		exit 1
+	fi
+}
+
+check_prereqs() {
+	if [ ! -f Cargo.toml ]; then
+		echo "ERROR: Cargo.toml not found in $(pwd)."
+		echo "       Run this script from the root of a Rust (Cargo) project."
+		exit 1
+	fi
+
+	echo "==> Checking prerequisites..."
+	require_cmd cargo "Install from https://rustup.rs"
+	require_cmd rustup "Install from https://rustup.rs"
+
+	if $WEB_BUILD; then
+		if ! command -v wasm-pack >/dev/null 2>&1; then
+			echo "INFO: Installing wasm-pack..."
+			cargo install wasm-pack
+		fi
+		echo "==> Adding wasm32 target..."
+		rustup target add wasm32-unknown-unknown
+	fi
+}
+
+setup_rustfmt_toml() {
+	if [ ! -f "$RUSTFMT_TOML" ]; then
+		echo "==> Creating $RUSTFMT_TOML"
+		cat > "$RUSTFMT_TOML" <<'EOF2'
 # Stable rustfmt configuration
 hard_tabs = true
 tab_spaces = 4
@@ -100,100 +131,108 @@ use_field_init_shorthand = true
 use_try_shorthand = true
 use_small_heuristics = "Max"
 EOF2
-else
-	echo "==> Using existing $RUSTFMT_TOML"
-fi
+	else
+		echo "==> Using existing $RUSTFMT_TOML"
+	fi
+}
 
-CI_MODE=false
-if [ "${CI:-}" = "true" ] || [ "${GITHUB_ACTIONS:-}" = "true" ]; then
-	CI_MODE=true
-fi
+# check_lengths: warns about .rs files/lines that are too long.
+# Rewritten from `find ... | while read ...` to `find ... > tmp; while read
+# ... done < tmp` so a failing `find` (e.g. unreadable directory) still trips
+# `set -e` and aborts the script, the same way it would under bash+pipefail.
+# With the old pipe form, on plain POSIX sh (no pipefail) a `find` failure was
+# silently swallowed because the pipeline's exit status was that of the
+# `while` loop, not `find`.
+check_lengths() {
+	TMP_RS_FILES=$(mktemp 2>/dev/null) || TMP_RS_FILES="${TMPDIR:-/tmp}/build-rs-files.$$"
+	find . -type f -name "*.rs" ! -path "./target/*" > "$TMP_RS_FILES"
+	while IFS= read -r file; do
+		total_lines=$(wc -l < "$file")
+		if [ "$total_lines" -gt "$MAX_FILE_LINES" ]; then
+			echo "WARN: $file has $total_lines lines (limit: $MAX_FILE_LINES) — consider splitting into submodules"
+		fi
+		awk -v file="$file" -v max="$MAX_LINE_WIDTH" '
+			length($0) > max {
+				printf "WARN: %s:%d exceeds %d chars (%d)\n", file, NR, max, length($0)
+			}
+		' "$file"
+	done < "$TMP_RS_FILES"
+	rm -f "$TMP_RS_FILES"
+	TMP_RS_FILES=""
+}
 
-if $SKIP_ALL; then
-	echo "==> Skipping all checks and tests (-n flag)."
-else
-	if ! $QUICK; then
-		echo "==> Running cargo fmt"
-		cargo fmt --all
+run_lint() {
+	echo "==> Running cargo fmt"
+	cargo fmt --all
 
-		echo "==> Running cargo clippy"
-		cargo clippy --all-targets -- -D warnings
+	echo "==> Running cargo clippy"
+	cargo clippy --all-targets -- -D warnings
 
-		echo "==> Checking file and line length (warnings only)"
-		find . -type f -name "*.rs" ! -path "./target/*" | while IFS= read -r file; do
-			total_lines=$(wc -l < "$file")
-			if [ "$total_lines" -gt "$MAX_FILE_LINES" ]; then
-				echo "WARN: $file has $total_lines lines (limit: $MAX_FILE_LINES) — consider splitting into submodules"
-			fi
-			awk -v file="$file" -v max="$MAX_LINE_WIDTH" '
-				length($0) > max {
-					printf "WARN: %s:%d exceeds %d chars (%d)\n", file, NR, max, length($0)
-				}
-			' "$file"
-		done
+	echo "==> Checking file and line length (warnings only)"
+	check_lengths
+}
+
+run_quick_tests() {
+	echo "==> Running pure-logic tests (cargo test --lib)..."
+	run_tolerant "pure-logic tests failed" cargo test --lib
+}
+
+run_full_tests() {
+	echo "==> Running all tests (unit, integration, docs)..."
+	run_tolerant "full test suite failed" cargo test
+
+	if $WEB_BUILD; then
+		echo "==> Running DOM-backed tests (wasm-pack test --headless --firefox)..."
+		run_tolerant "DOM-backed tests failed or the browser driver could not run" wasm-pack test --headless --firefox
 	fi
 
-	if ! $RUN_ALL; then
-		echo "==> Running pure-logic tests (cargo test --lib)..."
-		set +e
-		cargo test --lib
-		LIB_TEST_STATUS=$?
-		set -e
-		[ "$LIB_TEST_STATUS" -eq 0 ] || echo "==> WARNING: pure-logic tests failed (exit $LIB_TEST_STATUS). Continuing anyway."
+	if $RUN_MIRI; then
+		run_miri
+	else
+		echo "==> Skipping Miri (-c flag)."
 	fi
+}
+
+run_miri() {
+	if command -v cargo-miri >/dev/null 2>&1 || cargo +nightly miri --version >/dev/null 2>&1; then
+		echo "==> Running cargo miri test --lib"
+		run_tolerant "cargo miri test --lib failed or found UB — investigate before trusting unsafe code" \
+			env MIRIFLAGS="-Zmiri-disable-isolation" cargo +nightly miri test --lib
+	else
+		echo "==> Skipping Miri (nightly + 'miri' rustup component not found)"
+	fi
+}
+
+run_checks_and_tests() {
+	if $SKIP_ALL; then
+		echo "==> Skipping all checks and tests (-n flag)."
+		return 0
+	fi
+
+	$QUICK || run_lint
 
 	if $RUN_ALL; then
-		echo "==> Running all tests (unit, integration, docs)..."
-		if $WEB_BUILD && $CI_MODE; then
-			echo "==> CI mode: skipping the duplicate native cargo test pass; the browser suite is the authoritative web coverage here."
-		else
-			set +e
-			cargo test
-			ALL_TEST_STATUS=$?
-			set -e
-			[ "$ALL_TEST_STATUS" -eq 0 ] || echo "==> WARNING: full test suite failed (exit $ALL_TEST_STATUS). Continuing anyway."
-		fi
-
-		if $WEB_BUILD; then
-			echo "==> Running DOM-backed tests (wasm-pack test --headless --firefox)..."
-			set +e
-			wasm-pack test --headless --firefox
-			WASM_TEST_STATUS=$?
-			set -e
-			if [ "$WASM_TEST_STATUS" -ne 0 ]; then
-				echo "==> WARNING: DOM-backed tests failed or the browser driver could not run (exit $WASM_TEST_STATUS)."
-				echo "    Continuing to build anyway."
-			fi
-		fi
-
-		if $RUN_MIRI; then
-			if $WEB_BUILD && $CI_MODE; then
-				echo "==> CI mode: skipping Miri for the web build to avoid long duplicate passes; use a local non-CI run to enable the full Miri sweep."
-			elif command -v cargo-miri >/dev/null 2>&1 || cargo +nightly miri --version >/dev/null 2>&1; then
-				echo "==> Running cargo miri test --lib"
-				if ! MIRIFLAGS="-Zmiri-disable-isolation" cargo +nightly miri test --lib; then
-					echo "WARN: cargo miri test --lib failed or found UB — investigate before trusting unsafe code"
-				fi
-			else
-				echo "==> Skipping Miri (nightly + 'miri' rustup component not found)"
-			fi
-		else
-			echo "==> Skipping Miri (-c flag)."
-		fi
+		run_full_tests
+	else
+		run_quick_tests
 	fi
-fi
+}
 
-if $WEB_BUILD; then
-	echo "==> Building release (wasm-pack --target web)..."
-	wasm-pack build --target web --release
-	echo "==> Build complete. Output in pkg/"
-else
-	echo "==> Building release..."
-	cargo build --release
-	echo "==> Build complete. Binary available at target/release/app."
-fi
+do_build() {
+	if $WEB_BUILD; then
+		echo "==> Building release (wasm-pack --target web)..."
+		wasm-pack build --target web --release
+		echo "==> Build complete. Output in pkg/"
+	else
+		echo "==> Building release..."
+		cargo build --release
+		echo "==> Build complete. Binary available at target/release/app."
+	fi
+}
 
-if $READY_TO_RUN; then
+do_ready_to_run() {
+	$READY_TO_RUN || return 0
+
 	if $WEB_BUILD; then
 		echo "==> Ready to run in release."
 		echo "    Serve the generated bundle, e.g.:"
@@ -203,5 +242,15 @@ if $READY_TO_RUN; then
 		echo "==> Running app (cargo run --release)..."
 		cargo run --release
 	fi
-fi
+}
 
+main() {
+	parse_args "$@"
+	check_prereqs
+	setup_rustfmt_toml
+	run_checks_and_tests
+	do_build
+	do_ready_to_run
+}
+
+main "$@"

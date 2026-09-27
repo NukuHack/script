@@ -1,241 +1,233 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Image Display & Save Utility
 =============================
 
-A PyQt5-based GUI application for pasting, displaying, and saving images from the clipboard.
-Designed for efficient screenshot/image capture workflows where images need to be saved
-with sequential naming conventions.
+A GUI utility for pasting images from the clipboard, previewing them,
+and saving them with automatic sequential naming.
 
-Features:
-    - Paste images directly from clipboard (Ctrl+V)
-    - Display pasted images in a resizable preview area
-    - Save images with automatic sequential numbering (Ctrl+S)
-    - Editable save path with automatic counter detection
-    - Spinbox for manual counter adjustment
-    - Configurable base path, file extension, and starting counter via CLI args
+Works on Python 2.7 and Python 3.x.
+The only external dependency is PyQt5.
 
-Keyboard Shortcuts:
-    Ctrl+V  - Paste image from clipboard
-    Ctrl+S  - Save current image (auto-increments counter)
+Features
+--------
+* Ctrl+V : paste an image from the system clipboard
+* Ctrl+S : save the current image, then auto-increment the counter
+* Editable save path with automatic counter/extension detection
+* Spinbox for manual counter adjustment
+* "Next free counter" auto-detection on paste (never overwrites silently)
+* Status bar with feedback
+* Configurable via command-line arguments
 
-Usage:
-    python image_saver.py [OPTIONS]
+Usage
+-----
+    python img_saver.py [OPTIONS]
 
-Examples:
-    python image_saver.py
-    python image_saver.py --path "C:/Screenshots/capture" --ext png
-    python image_saver.py --path "/home/user/pics/shot" --counter 42 --quality 95
+Examples
+--------
+    python img_saver.py
+    python img_saver.py --path "C:/Screenshots/capture" --ext png
+    python img_saver.py --path "/home/user/pics/shot" --counter 42 --quality 95
 
-Author: (original author unknown)
 License: MIT
 """
 
-import sys
+from __future__ import absolute_import, division, print_function, unicode_literals
+
 import argparse
 import logging
-from pathlib import Path
-from typing import Optional
-
-# PyQt5 imports - works with PyQt5 >= 5.15
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QLineEdit, QVBoxLayout, QWidget,
-    QShortcut, QLabel, QHBoxLayout, QSpinBox, QMessageBox
-)
-from PyQt5.QtGui import QPixmap, QImage, QKeySequence
-from PyQt5.QtCore import Qt
+import os
+import sys
 
 # ---------------------------------------------------------------------------
-# Configuration defaults (used when CLI args are not supplied)
+# PyQt5 is the only external dependency.  Fail with a clear message if missing.
 # ---------------------------------------------------------------------------
-DEFAULT_BASE_PATH = str(Path.home() / "Pictures" / "image")
+try:
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QPixmap, QKeySequence
+    from PyQt5.QtWidgets import (
+        QApplication, QMainWindow, QLineEdit, QVBoxLayout, QWidget,
+        QShortcut, QLabel, QHBoxLayout, QSpinBox, QMessageBox,
+    )
+except ImportError:
+    sys.stderr.write(
+        "ERROR: PyQt5 is required.\n"
+        "       Install it with:  pip install PyQt5\n"
+        "       (On Python 2.7 you need PyQt5 <= 5.15.)\n"
+    )
+    raise
+
+
+# ---------------------------------------------------------------------------
+# Cross-version helpers
+# ---------------------------------------------------------------------------
+PY2 = sys.version_info[0] == 2
+
+
+def _fs_unicode(value):
+    """Return *value* as a unicode string, decoding bytes on Python 2."""
+    if PY2 and isinstance(value, bytes):
+        enc = sys.getfilesystemencoding() or 'utf-8'
+        try:
+            return value.decode(enc)
+        except (LookupError, UnicodeDecodeError):
+            return value.decode('utf-8', 'replace')
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Configuration defaults
+# ---------------------------------------------------------------------------
+DEFAULT_BASE_PATH = os.path.join(os.path.expanduser("~"), "Pictures", "image")
 DEFAULT_EXTENSION = "jpg"
 DEFAULT_COUNTER = 0
 DEFAULT_QUALITY = 90
 DEFAULT_WINDOW_WIDTH = 800
 DEFAULT_WINDOW_HEIGHT = 600
 
-# Enable High-DPI scaling (must be set before QApplication is created)
-QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+SUPPORTED_EXTENSIONS = ("jpg", "jpeg", "png", "bmp", "webp")
+LOSSY_EXTENSIONS = ("jpg", "jpeg", "webp")
+
+
+# Enable High-DPI scaling (must happen before QApplication is constructed).
+for _attr in ("AA_EnableHighDpiScaling", "AA_UseHighDpiPixmaps"):
+    if hasattr(Qt, _attr):
+        try:
+            QApplication.setAttribute(getattr(Qt, _attr), True)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
-def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
-    """
-    Parse command-line arguments with sensible fallbacks.
-
-    Args:
-        argv: Optional list of arguments (defaults to sys.argv[1:]).
-
-    Returns:
-        argparse.Namespace containing all configuration values.
-    """
+def parse_args(argv=None):
+    """Parse command-line arguments.  *argv* defaults to sys.argv[1:]."""
     parser = argparse.ArgumentParser(
-        prog="image_saver",
+        prog="img_saver",
         description="Paste, display, and save clipboard images with sequential naming.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--path", "-p",
-        type=str,
-        default=DEFAULT_BASE_PATH,
-        help="Base path (without counter or extension) for saved images.",
-    )
-    parser.add_argument(
-        "--ext", "-e",
-        type=str,
-        default=DEFAULT_EXTENSION,
-        choices=["jpg", "jpeg", "png", "bmp", "webp"],
-        help="Image file extension/format to save as.",
-    )
-    parser.add_argument(
-        "--counter", "-c",
-        type=int,
-        default=DEFAULT_COUNTER,
-        help="Initial save counter value. 0 means no numeric suffix.",
-    )
-    parser.add_argument(
-        "--quality", "-q",
-        type=int,
-        default=DEFAULT_QUALITY,
-        choices=range(1, 101),
-        metavar="[1-100]",
-        help="JPEG/WebP save quality (ignored for lossless formats).",
-    )
-    parser.add_argument(
-        "--width", "-W",
-        type=int,
-        default=DEFAULT_WINDOW_WIDTH,
-        help="Initial window width in pixels.",
-    )
-    parser.add_argument(
-        "--height", "-H",
-        type=int,
-        default=DEFAULT_WINDOW_HEIGHT,
-        help="Initial window height in pixels.",
-    )
-    parser.add_argument(
-        "--verbose", "-v",
-        action="store_true",
-        help="Enable verbose (DEBUG) logging.",
-    )
-    return parser.parse_args(argv)
+    parser.add_argument("--path", "-p", default=DEFAULT_BASE_PATH,
+                        help="Base path (without counter or extension).")
+    parser.add_argument("--ext", "-e", default=DEFAULT_EXTENSION,
+                        choices=list(SUPPORTED_EXTENSIONS),
+                        help="Image format to save as.")
+    parser.add_argument("--counter", "-c", type=int, default=DEFAULT_COUNTER,
+                        help="Initial save counter (0 = no numeric suffix).")
+    parser.add_argument("--quality", "-q", type=int, default=DEFAULT_QUALITY,
+                        metavar="1-100",
+                        help="Save quality for lossy formats (jpg/jpeg/webp).")
+    parser.add_argument("--width", "-W", type=int, default=DEFAULT_WINDOW_WIDTH,
+                        help="Initial window width.")
+    parser.add_argument("--height", "-H", type=int, default=DEFAULT_WINDOW_HEIGHT,
+                        help="Initial window height.")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Enable DEBUG logging.")
+
+    args = parser.parse_args(argv)
+
+    if not (1 <= args.quality <= 100):
+        parser.error("--quality must be between 1 and 100")
+    if args.counter < 0:
+        parser.error("--counter must be >= 0")
+
+    # Normalize strings on Python 2 (argparse gives bytes there).
+    args.path = _fs_unicode(args.path)
+    args.ext = _fs_unicode(args.ext)
+
+    return args
 
 
 # ---------------------------------------------------------------------------
 # Main application window
 # ---------------------------------------------------------------------------
 class ImageDisplayApp(QMainWindow):
-    """
-    Main application window for pasting, displaying, and saving images.
+    """Main application window for pasting, displaying, and saving images."""
 
-    Attributes:
-        base_path: Base filesystem path (without counter/extension).
-        extension: File extension used when saving (e.g., 'jpg').
-        save_counter: Current counter value for sequential file naming.
-        quality: Save quality for lossy formats.
-        current_image: The QImage currently displayed/saved.
-    """
+    def __init__(self,
+                 base_path=DEFAULT_BASE_PATH,
+                 extension=DEFAULT_EXTENSION,
+                 counter=DEFAULT_COUNTER,
+                 quality=DEFAULT_QUALITY,
+                 window_size=(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)):
+        super(ImageDisplayApp, self).__init__()
 
-    def __init__(
-        self,
-        base_path: str = DEFAULT_BASE_PATH,
-        extension: str = DEFAULT_EXTENSION,
-        counter: int = DEFAULT_COUNTER,
-        quality: int = DEFAULT_QUALITY,
-        window_size: tuple = (DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT),
-    ):
-        """
-        Initialize the application window.
-
-        Args:
-            base_path: Base filesystem path for saved images.
-            extension: File extension ('jpg', 'png', etc.).
-            counter: Initial counter value.
-            quality: Save quality for lossy formats (1-100).
-            window_size: (width, height) tuple for the window size.
-        """
-        super().__init__()
-
-        # --- Configuration -------------------------------------------------
-        self.base_path = base_path.rstrip("._")
+        # ---- configuration ------------------------------------------------
+        self.base_path = base_path.rstrip("._") or DEFAULT_BASE_PATH
         self.extension = extension.lstrip(".").lower()
-        self.save_counter = counter
-        self.quality = quality
+        self.save_counter = max(0, int(counter))
+        self.quality = int(quality)
+        self.current_image = None
 
-        # Ensure base directory exists (best-effort; user may edit path later)
-        try:
-            Path(self.base_path).parent.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            logging.warning("Could not create base directory: %s", exc)
+        self._ensure_parent_dir(self._build_path_string(self.save_counter))
 
-        # --- Window setup --------------------------------------------------
+        # ---- window -------------------------------------------------------
         self.setWindowTitle("Image Display & Save")
-        self.setFixedSize(*window_size)
+        self.resize(*window_size)
+        self.setMinimumSize(320, 240)
 
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(5, 5, 5, 5)
-        main_layout.setSpacing(5)
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(6, 6, 6, 6)
+        main_layout.setSpacing(6)
 
-        # --- Path + counter row -------------------------------------------
+        # ---- path + counter row ------------------------------------------
         path_layout = QHBoxLayout()
-        path_layout.setSpacing(10)
+        path_layout.setSpacing(8)
 
         self.path_input = QLineEdit(self._build_path_string(self.save_counter))
         self.path_input.setStyleSheet(
-            "QLineEdit { font-size: 14px; border: 1px solid #ccc; "
-            "background: #f0f0f0; padding: 2px; }"
+            "QLineEdit { font-size: 13px; border: 1px solid #ccc;"
+            " background: #fafafa; padding: 4px; }"
         )
-        self.path_input.setFixedHeight(40)
-        self.path_input.editingFinished.connect(self.update_base_path)
-        self.path_input.setFocusPolicy(Qt.StrongFocus)
-        path_layout.addWidget(self.path_input, stretch=1)
+        self.path_input.setMinimumHeight(32)
+        self.path_input.editingFinished.connect(self._on_path_edited)
+        path_layout.addWidget(self.path_input, 1)
 
         counter_label = QLabel("Save #:")
-        counter_label.setStyleSheet("font-size: 14px;")
         path_layout.addWidget(counter_label)
 
         self.counter_input = QSpinBox()
         self.counter_input.setStyleSheet(
-            "QSpinBox { font-size: 14px; border: 1px solid #ccc; "
-            "background: #f0f0f0; padding: 2px; }"
+            "QSpinBox { font-size: 13px; border: 1px solid #ccc;"
+            " background: #fafafa; padding: 4px; }"
         )
-        self.counter_input.setFixedWidth(70)
-        self.counter_input.setFixedHeight(40)
         self.counter_input.setRange(0, 999999)
         self.counter_input.setValue(self.save_counter)
-        self.counter_input.setFocusPolicy(Qt.StrongFocus)
-        self.counter_input.valueChanged.connect(self.update_counter)
+        self.counter_input.setFixedWidth(80)
+        self.counter_input.setMinimumHeight(32)
+        self.counter_input.valueChanged.connect(self._on_counter_changed)
         path_layout.addWidget(self.counter_input)
 
         main_layout.addLayout(path_layout)
 
-        # --- Image display -------------------------------------------------
+        # ---- image preview ------------------------------------------------
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setStyleSheet(
-            "border: 1px solid #ccc; background: #f8f8f8;"
+            "border: 1px solid #ccc; background: #f8f8f8; color: #888;"
         )
-        self.image_label.setFocusPolicy(Qt.StrongFocus)
+        self.image_label.setText("Paste an image with Ctrl+V")
         self.image_label.setMinimumSize(200, 200)
-        main_layout.addWidget(self.image_label, stretch=1)
+        main_layout.addWidget(self.image_label, 1)
 
-        # --- Clipboard & shortcuts ----------------------------------------
-        self.clipboard = QApplication.clipboard()
-
+        # ---- shortcuts ----------------------------------------------------
         self.paste_shortcut = QShortcut(QKeySequence("Ctrl+V"), self)
         self.paste_shortcut.activated.connect(self.handle_paste)
 
         self.save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
         self.save_shortcut.activated.connect(self.save_current_image)
 
-        # --- State ---------------------------------------------------------
-        self.current_image: Optional[QImage] = None
+        # ---- status bar ---------------------------------------------------
+        self.statusBar().showMessage(
+            "Ready.  Ctrl+V to paste,  Ctrl+S to save."
+        )
+
+        # ---- clipboard ----------------------------------------------------
+        self.clipboard = QApplication.clipboard()
 
         self.image_label.setFocus()
         logging.debug(
@@ -246,149 +238,203 @@ class ImageDisplayApp(QMainWindow):
     # ------------------------------------------------------------------
     # Path helpers
     # ------------------------------------------------------------------
-    def _build_path_string(self, counter: int) -> str:
+    def _build_path_string(self, counter):
         """Build the display path string for a given counter value."""
-        if counter == 0:
-            return f"{self.base_path}.{self.extension}"
-        return f"{self.base_path}_{counter}.{self.extension}"
+        if counter and counter > 0:
+            return "{0}_{1}.{2}".format(self.base_path, counter, self.extension)
+        return "{0}.{1}".format(self.base_path, self.extension)
 
-    def update_base_path(self):
+    @staticmethod
+    def _ensure_parent_dir(path):
+        """Best-effort creation of the parent directory of *path*."""
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent and not os.path.isdir(parent):
+            try:
+                os.makedirs(parent)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _split_path(text, default_ext):
         """
-        Parse the user-edited path field to extract base path and counter.
+        Split a full path string into (base, counter_or_None, extension).
 
-        Recognizes patterns like '/foo/bar_42.jpg' and splits them into
-        base path '/foo/bar' and counter 42.
+        Recognizes patterns like '/foo/bar_42.jpg'.
         """
-        full_path = self.path_input.text().strip()
-        if not full_path:
-            return
-
-        # Strip known extension
-        stem = full_path
-        for ext in (".jpg", ".jpeg", ".png", ".bmp", ".webp"):
-            if stem.lower().endswith(ext):
-                stem = stem[: -len(ext)]
-                self.extension = ext.lstrip(".")
+        stem = text
+        ext = default_ext
+        lower = stem.lower()
+        for e in (".jpg", ".jpeg", ".png", ".bmp", ".webp"):
+            if lower.endswith(e):
+                stem = stem[: -len(e)]
+                ext = e[1:]
                 break
 
-        # Try to split on trailing _<digits>
+        stem = stem.rstrip("._")
+
         if "_" in stem:
             head, _, tail = stem.rpartition("_")
-            if tail.isdigit():
-                self.base_path = head
-                self.save_counter = int(tail)
-                # Block signals to avoid recursive updates
-                self.counter_input.blockSignals(True)
-                self.counter_input.setValue(self.save_counter)
-                self.counter_input.blockSignals(False)
-                logging.debug("Parsed path: base=%s counter=%d",
-                              self.base_path, self.save_counter)
-                return
+            if head and tail.isdigit():
+                return head, int(tail), ext
 
-        # No counter found
-        self.base_path = stem
-        self.update_path_display()
+        return stem, None, ext
 
-    def update_counter(self, value: int):
-        """Update the save counter from the spinbox."""
+    def _on_path_edited(self):
+        """Parse the user-edited path field to extract base, counter, extension."""
+        text = self.path_input.text().strip()
+        if not text:
+            self._refresh_path_display()
+            return
+
+        base, counter, ext = self._split_path(text, self.extension)
+
+        if base:
+            self.base_path = base
+        self.extension = ext
+
+        if counter is not None:
+            self.save_counter = counter
+            self._set_counter_silently(counter)
+
+        self._refresh_path_display()
+        logging.debug("Parsed path: base=%s counter=%s ext=%s",
+                      self.base_path, self.save_counter, self.extension)
+
+    def _set_counter_silently(self, value):
+        """Set the spinbox value without emitting valueChanged."""
+        self.counter_input.blockSignals(True)
+        try:
+            self.counter_input.setValue(value)
+        finally:
+            self.counter_input.blockSignals(False)
+
+    def _on_counter_changed(self, value):
         self.save_counter = value
-        self.update_path_display()
+        self._refresh_path_display()
 
-    def update_path_display(self):
-        """Refresh the path input field to reflect current state."""
+    def _refresh_path_display(self):
         self.path_input.setText(self._build_path_string(self.save_counter))
 
     # ------------------------------------------------------------------
     # Clipboard / image handling
     # ------------------------------------------------------------------
     def handle_paste(self):
-        """Route Ctrl+V based on current focus."""
-        if self.counter_input.hasFocus():
-            # Let the spinbox paste text normally
-            return
+        """
+        Route Ctrl+V.
+
+        If a text widget is focused we forward the paste to it so that
+        Ctrl+V keeps working inside the path field and the spinbox.
+        """
         if self.path_input.hasFocus():
-            # Let the line edit paste text normally
+            self.path_input.paste()
+            return
+        if self.counter_input.hasFocus():
+            editor = self.counter_input.lineEdit()
+            if editor is not None:
+                editor.paste()
             return
         self.paste_from_clipboard()
 
     def paste_from_clipboard(self):
         """Paste image data from the system clipboard."""
-        clipboard_image = self.clipboard.image()
-        if clipboard_image.isNull():
-            logging.info("Clipboard does not contain an image.")
+        image = self.clipboard.image()
+        if image.isNull():
+            self.statusBar().showMessage("Clipboard contains no image.", 3000)
+            logging.info("Clipboard contains no image.")
             return
 
-        self.current_image = clipboard_image
+        self.current_image = image
         self.display_image()
-        # Reset counter for new image
-        self.save_counter = 0
-        self.counter_input.blockSignals(True)
-        self.counter_input.setValue(0)
-        self.counter_input.blockSignals(False)
-        self.update_path_display()
-        logging.debug("Pasted image: %dx%d",
-                      clipboard_image.width(), clipboard_image.height())
+
+        # Reset to the next available counter for the current base path so
+        # we never silently overwrite an existing file.
+        next_counter = self._next_free_counter()
+        self.save_counter = next_counter
+        self._set_counter_silently(next_counter)
+        self._refresh_path_display()
+
+        self.statusBar().showMessage(
+            "Pasted {0}×{1} image.  Ctrl+S to save.".format(
+                image.width(), image.height()),
+            4000,
+        )
+        logging.debug("Pasted image %dx%d", image.width(), image.height())
+
+    def _next_free_counter(self, start=0, limit=999999):
+        """Return the first counter whose target file does not yet exist."""
+        c = start
+        while c <= limit:
+            if not os.path.exists(self._build_path_string(c)):
+                return c
+            c += 1
+        return start
 
     def save_current_image(self):
         """Save the currently displayed image to disk."""
+        # Don't hijack Ctrl+S while the user is editing a text field.
         if self.path_input.hasFocus() or self.counter_input.hasFocus():
-            return  # Don't hijack Ctrl+S while editing fields
+            return
 
-        if not self.current_image or self.current_image.isNull():
+        if self.current_image is None or self.current_image.isNull():
+            self.statusBar().showMessage("Nothing to save.", 3000)
             logging.info("No image to save.")
             return
 
         counter = self.counter_input.value()
         save_path = self._build_path_string(counter)
+        self._ensure_parent_dir(save_path)
 
-        # Ensure directory exists
-        try:
-            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            QMessageBox.critical(self, "Save Error",
-                                 f"Could not create directory:\n{exc}")
-            return
-
-        # Save with appropriate format
         fmt = self.extension.upper()
-        save_kwargs = {}
-        if self.extension in ("jpg", "jpeg", "webp"):
-            save_kwargs["quality"] = self.quality
+        try:
+            if self.extension in LOSSY_EXTENSIONS:
+                ok = self.current_image.save(save_path, fmt, self.quality)
+            else:
+                ok = self.current_image.save(save_path, fmt)
+        except Exception as exc:
+            ok = False
+            logging.exception("Exception during save: %s", exc)
 
-        if self.current_image.save(save_path, fmt, **save_kwargs):
-            logging.info("Image saved to %s", save_path)
-            # Auto-increment counter for next save
+        if ok:
+            logging.info("Saved %s", save_path)
+            self.statusBar().showMessage(
+                "Saved: {0}".format(save_path), 4000)
+            # Auto-increment for next save (emits valueChanged -> refresh).
             self.counter_input.setValue(counter + 1)
         else:
-            QMessageBox.warning(self, "Save Failed",
-                                f"Failed to save image to:\n{save_path}")
-            logging.error("Failed to save image to %s", save_path)
+            QMessageBox.warning(
+                self, "Save Failed",
+                "Failed to save image to:\n{0}".format(save_path))
+            self.statusBar().showMessage("Save failed.", 4000)
+            logging.error("Save failed for %s", save_path)
 
     def display_image(self):
-        """Render the current image scaled to fit the label."""
-        if not self.current_image or self.current_image.isNull():
+        """Render the current image, scaling down to fit the label if needed."""
+        if self.current_image is None or self.current_image.isNull():
             return
-        scaled = self.current_image.scaled(
-            self.image_label.width(),
-            self.image_label.height(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
-        self.image_label.setPixmap(QPixmap.fromImage(scaled))
+
+        label_w = max(1, self.image_label.width())
+        label_h = max(1, self.image_label.height())
+        img = self.current_image
+
+        # Only scale *down*; never upscale a small image.
+        if img.width() > label_w or img.height() > label_h:
+            img = img.scaled(label_w, label_h,
+                             Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+        self.image_label.setPixmap(QPixmap.fromImage(img))
 
     # ------------------------------------------------------------------
     # Qt event overrides
     # ------------------------------------------------------------------
     def resizeEvent(self, event):
-        """Redisplay image when the window is resized."""
-        super().resizeEvent(event)
+        super(ImageDisplayApp, self).resizeEvent(event)
         self.display_image()
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-def main(argv: Optional[list] = None) -> int:
+def main(argv=None):
     """Application entry point."""
     args = parse_args(argv)
 
@@ -397,7 +443,10 @@ def main(argv: Optional[list] = None) -> int:
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
-    app = QApplication(sys.argv)
+    # Qt's QApplication wants argv; don't leak our custom flags into it.
+    qargv = sys.argv[:1] if sys.argv else ["img_saver"]
+    app = QApplication(qargv)
+
     window = ImageDisplayApp(
         base_path=args.path,
         extension=args.ext,

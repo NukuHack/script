@@ -38,6 +38,13 @@
      (id) == CLOCK_MONOTONIC_RAW || (id) == CLOCK_BOOTTIME || \
      (id) == CLOCK_REALTIME_COARSE || (id) == CLOCK_MONOTONIC_COARSE)
 
+/* Floors that prevent scaled timeouts from rounding down to zero and
+ * spinning the tracee in a seccomp/trace stop loop. */
+#define MIN_SCALED_NS 100000   /* 100 us, for timespec-based waits */
+#define MIN_SCALED_MS 1        /* 1 ms, for int-millisecond waits */
+
+static int g_trap_epoll = 0;   /* opt-in via DILATE_TRAP_EPOLL=1 */
+
 /* ---- global state ---- */
 static double g_factor = 1.0;
 static struct timespec g_ref_mono_t0;
@@ -45,6 +52,11 @@ static struct timespec g_base[8];
 static int g_base_valid[8];
 static pid_t g_pids[MAX_TRACEES];
 static int g_npids = 0;
+
+/* ---- debug logging (enable with DILATE_DEBUG=1) ---- */
+static int g_debug = 0;
+#define DBG(...) do { if (g_debug) { \
+    fprintf(stderr, "[dilate] " __VA_ARGS__); fputc('\n', stderr); } } while (0)
 
 /* ---- helpers ---- */
 static void die(const char *msg) { perror(msg); exit(1); }
@@ -60,6 +72,21 @@ static void double_to_ts(double secs, struct timespec *ts) {
     ts->tv_sec  = (time_t)secs;
     ts->tv_nsec = (long)((secs - (double)ts->tv_sec) * 1e9);
     ts_normalize(ts);
+}
+
+static double scale_seconds(double secs) {
+    if (g_factor <= 0.0) return secs;
+    double s = secs / g_factor;
+    if (secs > 0.0 && s < (double)MIN_SCALED_NS / 1e9)
+        s = (double)MIN_SCALED_NS / 1e9;
+    return s;
+}
+
+static int scale_ms(int ms) {
+    if (ms <= 0 || g_factor <= 0.0) return ms;
+    int s = (int)((double)ms / g_factor);
+    if (s < MIN_SCALED_MS) s = MIN_SCALED_MS;
+    return s;
 }
 static double real_elapsed_now(void) {
     struct timespec now;
@@ -164,6 +191,7 @@ static void patch_ja(int at, int target) {
 }
 
 static void build_filter(void) {
+    if (getenv("DILATE_TRAP_EPOLL")) g_trap_epoll = 1;
     g_filter_len = 0;
 
     /* Arch check */
@@ -193,11 +221,13 @@ static void build_filter(void) {
     TRAP(SYS_poll);
     TRAP(SYS_select);
     TRAP(SYS_pselect6);
-    TRAP(SYS_epoll_wait);
-    TRAP(SYS_epoll_pwait);
+    if (g_trap_epoll) {
+        TRAP(SYS_epoll_wait);
+        TRAP(SYS_epoll_pwait);
 #ifdef SYS_epoll_pwait2
-    TRAP(SYS_epoll_pwait2);
+        TRAP(SYS_epoll_pwait2);
 #endif
+    }
 #undef TRAP
 
     /* futex: dispatch to a sub-block that also checks the op */
@@ -309,7 +339,7 @@ static void handle_nanosleep(pid_t pid, struct user_regs_struct *regs) {
     if (tracee_read(pid, req_ptr, &req, sizeof req) == 0 && g_factor > 0.0) {
         double secs = (double)req.s + (double)req.ns / 1e9;
         struct timespec nt;
-        double_to_ts(secs / g_factor, &nt);
+        double_to_ts(scale_seconds(secs), &nt);
         struct { long s; long ns; } nr = { nt.tv_sec, nt.tv_nsec };
         tracee_write(pid, req_ptr, &nr, sizeof nr);
     }
@@ -333,6 +363,7 @@ static void handle_clock_nanosleep(pid_t pid, struct user_regs_struct *regs) {
         fake_time_for_clock((int)clockid, &fake_now);
         double target = (double)req.s + (double)req.ns / 1e9;
         double rem_real = (target - ts_to_double(&fake_now)) / g_factor;
+        if (rem_real < 0.0) rem_real = 0.0;
         clockid_t rc = ((int)clockid >= 0 && (int)clockid < 8)
                        ? (clockid_t)clockid : CLOCK_REALTIME;
         struct timespec real_now;
@@ -340,7 +371,7 @@ static void handle_clock_nanosleep(pid_t pid, struct user_regs_struct *regs) {
         double_to_ts(ts_to_double(&real_now) + rem_real, &nt);
     } else {
         double secs = (double)req.s + (double)req.ns / 1e9;
-        double_to_ts(secs / g_factor, &nt);
+        double_to_ts(scale_seconds(secs), &nt);
     }
     struct { long s; long ns; } nr = { nt.tv_sec, nt.tv_nsec };
     tracee_write(pid, req_ptr, &nr, sizeof nr);
@@ -361,19 +392,25 @@ static void handle_futex(pid_t pid, struct user_regs_struct *regs) {
         cont(pid); return;
     }
 
-    int absolute = (base_cmd == FUTEX_WAIT_BITSET) && (op & FUTEX_CLOCK_REALTIME);
+    /* FUTEX_WAIT_BITSET is always absolute; its clock is CLOCK_REALTIME
+     * when FUTEX_CLOCK_REALTIME is set, otherwise CLOCK_MONOTONIC.
+     * FUTEX_WAIT (and everything else we trap) is relative. */
+    int absolute = (base_cmd == FUTEX_WAIT_BITSET);
+    int clkid    = (op & FUTEX_CLOCK_REALTIME) ? CLOCK_REALTIME : CLOCK_MONOTONIC;
+
     struct timespec nt;
     if (absolute) {
         struct timespec fake_now;
-        fake_time_for_clock(CLOCK_REALTIME, &fake_now);
+        fake_time_for_clock(clkid, &fake_now);
         double target   = (double)req.s + (double)req.ns / 1e9;
         double rem_real = (target - ts_to_double(&fake_now)) / g_factor;
+        if (rem_real < 0.0) rem_real = 0.0;
         struct timespec real_now;
-        clock_gettime(CLOCK_REALTIME, &real_now);
+        clock_gettime(clkid, &real_now);
         double_to_ts(ts_to_double(&real_now) + rem_real, &nt);
     } else {
         double secs = (double)req.s + (double)req.ns / 1e9;
-        double_to_ts(secs / g_factor, &nt);
+        double_to_ts(scale_seconds(secs), &nt);
     }
     struct { long s; long ns; } nr = { nt.tv_sec, nt.tv_nsec };
     tracee_write(pid, timeout_ptr, &nr, sizeof nr);
@@ -388,7 +425,7 @@ static void handle_ppoll(pid_t pid, struct user_regs_struct *regs) {
     if (tracee_read(pid, tp, &req, sizeof req) != 0 || g_factor <= 0.0) { cont(pid); return; }
     double secs = (double)req.s + (double)req.ns / 1e9;
     struct timespec nt;
-    double_to_ts(secs / g_factor, &nt);
+    double_to_ts(scale_seconds(secs), &nt);
     struct { long s; long ns; } nr = { nt.tv_sec, nt.tv_nsec };
     tracee_write(pid, tp, &nr, sizeof nr);
     cont(pid);
@@ -397,8 +434,8 @@ static void handle_ppoll(pid_t pid, struct user_regs_struct *regs) {
 /* poll(fds, nfds, timeout_ms) -> rdx (int in register, no memory) */
 static void handle_poll(pid_t pid, struct user_regs_struct *regs) {
     int t = (int)regs->rdx;
-    if (t > 0 && g_factor > 0.0) {
-        int s = (int)(t / g_factor); if (s < 0) s = 0;
+    int s = scale_ms(t);
+    if (s != t) {
         regs->rdx = (unsigned long long)s;
         set_regs(pid, regs);
     }
@@ -412,7 +449,7 @@ static void handle_select(pid_t pid, struct user_regs_struct *regs) {
     struct { long s; long us; } req;
     if (tracee_read(pid, tp, &req, sizeof req) != 0 || g_factor <= 0.0) { cont(pid); return; }
     double secs = (double)req.s + (double)req.us / 1e6;
-    double sc   = secs / g_factor;
+    double sc   = scale_seconds(secs);
     struct { long s; long us; } nv;
     nv.s  = (long)sc;
     nv.us = (long)((sc - (double)nv.s) * 1e6);
@@ -430,7 +467,7 @@ static void handle_pselect6(pid_t pid, struct user_regs_struct *regs) {
     if (tracee_read(pid, tp, &req, sizeof req) != 0 || g_factor <= 0.0) { cont(pid); return; }
     double secs = (double)req.s + (double)req.ns / 1e9;
     struct timespec nt;
-    double_to_ts(secs / g_factor, &nt);
+    double_to_ts(scale_seconds(secs), &nt);
     struct { long s; long ns; } nr = { nt.tv_sec, nt.tv_nsec };
     tracee_write(pid, tp, &nr, sizeof nr);
     cont(pid);
@@ -439,8 +476,8 @@ static void handle_pselect6(pid_t pid, struct user_regs_struct *regs) {
 /* epoll_wait(epfd, events, maxevents, timeout_ms) -> r10 (int in register) */
 static void handle_epoll_wait(pid_t pid, struct user_regs_struct *regs) {
     int t = (int)regs->r10;
-    if (t > 0 && g_factor > 0.0) {
-        int s = (int)(t / g_factor); if (s < 0) s = 0;
+    int s = scale_ms(t);
+    if (s != t) {
         regs->r10 = (unsigned long long)s;
         set_regs(pid, regs);
     }
@@ -462,7 +499,7 @@ static void handle_epoll_pwait2(pid_t pid, struct user_regs_struct *regs) {
     if (tracee_read(pid, tp, &req, sizeof req) != 0 || g_factor <= 0.0) { cont(pid); return; }
     double secs = (double)req.s + (double)req.ns / 1e9;
     struct timespec nt;
-    double_to_ts(secs / g_factor, &nt);
+    double_to_ts(scale_seconds(secs), &nt);
     struct { long s; long ns; } nr = { nt.tv_sec, nt.tv_nsec };
     tracee_write(pid, tp, &nr, sizeof nr);
     cont(pid);
@@ -480,10 +517,39 @@ static void seed_base_clocks(void) {
     }
 }
 
+static const char *syscall_name(long nr) {
+    switch (nr) {
+    case SYS_clock_gettime:   return "clock_gettime";
+    case SYS_gettimeofday:    return "gettimeofday";
+    case SYS_nanosleep:       return "nanosleep";
+    case SYS_clock_nanosleep: return "clock_nanosleep";
+    case SYS_futex:           return "futex";
+    case SYS_ppoll:           return "ppoll";
+    case SYS_poll:            return "poll";
+    case SYS_select:          return "select";
+    case SYS_pselect6:        return "pselect6";
+    case SYS_epoll_wait:      return "epoll_wait";
+    case SYS_epoll_pwait:     return "epoll_pwait";
+#ifdef SYS_time
+    case SYS_time:            return "time";
+#endif
+#ifdef SYS_epoll_pwait2
+    case SYS_epoll_pwait2:    return "epoll_pwait2";
+#endif
+    default:                  return "?";
+    }
+}
+
 static void dispatch_seccomp_stop(pid_t pid) {
     struct user_regs_struct regs;
     if (get_regs(pid, &regs) == -1) { cont(pid); return; }
     long nr = regs.orig_rax;
+    if (g_debug) {
+        if (nr == SYS_clock_gettime)
+            DBG("pid %d %s(clockid=%ld)", pid, syscall_name(nr), (long)regs.rdi);
+        else
+            DBG("pid %d %s", pid, syscall_name(nr));
+    }
     switch (nr) {
     case SYS_clock_gettime:    handle_clock_gettime_family(pid, &regs, 0); break;
     case SYS_gettimeofday:     handle_clock_gettime_family(pid, &regs, 1); break;
@@ -497,10 +563,10 @@ static void dispatch_seccomp_stop(pid_t pid) {
     case SYS_poll:             handle_poll(pid, &regs); break;
     case SYS_select:           handle_select(pid, &regs); break;
     case SYS_pselect6:         handle_pselect6(pid, &regs); break;
-    case SYS_epoll_wait:       handle_epoll_wait(pid, &regs); break;
-    case SYS_epoll_pwait:      handle_epoll_pwait(pid, &regs); break;
+    case SYS_epoll_wait:       if (g_trap_epoll) handle_epoll_wait(pid, &regs); else cont(pid); break;
+    case SYS_epoll_pwait:      if (g_trap_epoll) handle_epoll_pwait(pid, &regs); else cont(pid); break;
 #ifdef SYS_epoll_pwait2
-    case SYS_epoll_pwait2:     handle_epoll_pwait2(pid, &regs); break;
+    case SYS_epoll_pwait2:     if (g_trap_epoll) handle_epoll_pwait2(pid, &regs); else cont(pid); break;
 #endif
     default:                   cont(pid); break;
     }
@@ -514,6 +580,7 @@ int main(int argc, char **argv) {
     }
     g_factor = atof(argv[1]);
     if (g_factor <= 0.0) { fprintf(stderr, "factor must be > 0\n"); return 2; }
+    if (getenv("DILATE_DEBUG")) g_debug = 1;
 
     pid_t pid = fork();
     if (pid == -1) die("fork");
@@ -531,7 +598,7 @@ int main(int argc, char **argv) {
 
     long opts = PTRACE_O_TRACESECCOMP | PTRACE_O_EXITKILL |
                 PTRACE_O_TRACECLONE   | PTRACE_O_TRACEFORK |
-                PTRACE_O_TRACEVFORK;
+                PTRACE_O_TRACEVFORK   | PTRACE_O_TRACEEXEC;
     if (ptrace(PTRACE_SETOPTIONS, pid, 0, opts) == -1) die("PTRACE_SETOPTIONS");
 
     seed_base_clocks();
@@ -549,6 +616,7 @@ int main(int argc, char **argv) {
             die("waitpid");
         }
         if (WIFEXITED(ws) || WIFSIGNALED(ws)) {
+            DBG("pid %d exited (status=0x%x)", w, ws);
             untrack_pid(w);
             if (w == pid) {
                 int code = WIFEXITED(ws) ? WEXITSTATUS(ws) : 128 + WTERMSIG(ws);
@@ -566,6 +634,7 @@ int main(int argc, char **argv) {
         int event = ws >> 16;
 
         if (event == PTRACE_EVENT_SECCOMP) {
+            DBG("pid %d seccomp event", w);
             dispatch_seccomp_stop(w);
         } else if (event == PTRACE_EVENT_CLONE ||
                    event == PTRACE_EVENT_FORK  ||
@@ -573,9 +642,33 @@ int main(int argc, char **argv) {
             unsigned long newpid = 0;
             if (ptrace(PTRACE_GETEVENTMSG, w, 0, &newpid) == 0)
                 track_pid((pid_t)newpid);
+            DBG("pid %d fork/clone/vfork -> %lu", w, newpid);
+            ptrace(PTRACE_CONT, w, 0, 0);
+        } else if (event == PTRACE_EVENT_EXEC) {
+            /* execve() stop. The kernel reports it as SIGTRAP; if we
+             * blindly re-inject that signal the tracee dies on the spot
+             * (this is exactly what killed the Wine launcher). */
+            DBG("pid %d exec", w);
+            ptrace(PTRACE_CONT, w, 0, 0);
+        } else if (sig == SIGTRAP) {
+            /* Defensive: if TRACEEXEC were ever disabled we'd land here
+             * for a post-exec trap. Do NOT deliver SIGTRAP — it kills
+             * the tracee. */
+            DBG("pid %d SIGTRAP (event=%d)", w, event);
             ptrace(PTRACE_CONT, w, 0, 0);
         } else {
-            ptrace(PTRACE_CONT, w, 0, sig ? sig : 0);
+            /* An auto-attached child (via PTRACE_O_TRACECLONE/FORK/VFORK)
+             * always reports its very first stop with WSTOPSIG == SIGSTOP.
+             * Re-injecting that signal through PTRACE_CONT puts the child
+             * straight back into group-stop → infinite stop loop → the
+             * child never runs, wineserver never comes up, and Wine silently
+             * times out. Same story for the other job-control stops. */
+            int deliver = sig;
+            if (sig == SIGSTOP || sig == SIGTSTP ||
+                sig == SIGTTIN || sig == SIGTTOU)
+                deliver = 0;
+            DBG("pid %d stop sig=%d event=%d deliver=%d", w, sig, event, deliver);
+            ptrace(PTRACE_CONT, w, 0, deliver);
         }
     }
     return 0;

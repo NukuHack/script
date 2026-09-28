@@ -19,6 +19,8 @@
 #   CFLAGS         extra cflags
 #   WINE_BIN       wine binary to invoke (default: wine)
 #   WINEPREFIX_DILATE  prefix used by `wine` mode (default: ~/.wine-dilate)
+#   WINEDEBUG_DILATE   WINEDEBUG value for the run (default: -all; set to ""
+#                      or err+all to see Wine's own diagnostics)
 
 set -euo pipefail
 
@@ -76,6 +78,7 @@ NOTES
   * No root needed for `run` mode (unprivileged process ptracing its own
     child is allowed by default). `wine` mode just needs a writable
     WINEPREFIX.
+  * If Wine exits silently, try DILATE_DEBUG=1 and WINEDEBUG_DILATE=err+all.
 EOF
 }
 
@@ -198,7 +201,9 @@ cmd_wine() {
     warn "Only syscall-backed clocks (GetTickCount/timeGetTime/Sleep) are affected."
     info "launching: WINEPREFIX=$prefix $wine_bin $exe_abs  under dilate ${factor}x"
 
-    exec env WINEPREFIX="$prefix" WINEDEBUG=-all \
+    # WINEDEBUG_DILATE lets you see Wine's own diagnostics when something
+    # goes wrong (silent exit, missing wineserver, Steam not found, ...).
+    exec env WINEPREFIX="$prefix" WINEDEBUG="${WINEDEBUG_DILATE:--all}" \
         "$DILATE_BIN" "$factor" -- "$wine_bin" "$exe_abs" "$@"
 }
 

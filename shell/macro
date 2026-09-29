@@ -1,212 +1,485 @@
 #!/bin/sh
 #
-# Unified macro script: clicks a mouse button OR presses a key, repeatedly
-# or held down, paused/resumed with Caps Lock.
+# macro - repeat a mouse click / key press (or hold it down), toggled by Caps Lock.
 #
-# Usage: ./macro.sh <target> [sleep_time|h]
+# One POSIX sh file, no Python, no pip. It uses whatever the OS already has:
+#   Linux    xdotool                      (X11 / XWayland)
+#   macOS    osascript (JXA + CoreGraphics, built in)
+#   Windows  PowerShell + user32.dll      (Git Bash, MSYS2, Cygwin, WSL)
 #
-# Target:
-#   l, left, r, right, m, middle   -> mouse click
-#   any other value                -> keyboard key (e.g. d, space, w, Up)
-#
-# Time:
-#   <number>  - repeat every N seconds (e.g. 0.5, 1, 2)
-#   h         - HOLD down continuously
-#
-# Toggle Caps Lock to PAUSE/RESUME. Press Ctrl+C to stop.
+# Run without arguments (or with --help) for usage.
 
-if [ $# -eq 0 ]; then
-    echo "Usage: $0 <target> [sleep_time|h]"
-    echo ""
-    echo "Target:"
-    echo "  l / left    - Left click"
-    echo "  r / right   - Right click"
-    echo "  m / middle  - Middle click"
-    echo "  <key>       - Any keyboard key (e.g. d, space, w, Up)"
-    echo "  key:<letter> - Force key mode for letters that collide with"
-    echo "                 mouse shortcuts (e.g. key:r, key:l, key:m)"
-    echo ""
-    echo "Time Options:"
-    echo "  <number>  - Repeat every N seconds (e.g. 0.5, 1, 2)"
-    echo "  h         - HOLD down continuously"
-    echo ""
-    echo "Toggle Caps Lock to PAUSE/RESUME the macro"
-    echo "Press Ctrl+C to completely stop"
-    exit 1
+PROG=${0##*/}
+
+# ---------------------------------------------------------------- styling ---
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    ESC=$(printf '\033')
+    B="${ESC}[1m"; D="${ESC}[2m"; C="${ESC}[36m"; Y="${ESC}[33m"; N="${ESC}[0m"
+else
+    B=; D=; C=; Y=; N=
 fi
-
-target_input=$1
-sleep_time=${2:-1}
-hold_mode=false
-
-if [ "$sleep_time" = "h" ] || [ "$sleep_time" = "hold" ]; then
-    hold_mode=true
-    sleep_time=1  # fallback value, unused in hold mode
-fi
-
-# Decide whether target is a mouse button or a keyboard key
-mode="key"
-button=""
-button_name=""
-key_formatted=""
-
-case "$target_input" in
-    key:*)
-        mode="key"
-        target_input="${target_input#key:}"
-        key_lower=$(echo "$target_input" | tr '[:upper:]' '[:lower:]')
-        case $key_lower in
-            up|down|left_arrow|right_arrow)
-                key_formatted="$(echo ${key_lower:0:1} | tr '[:lower:]' '[:upper:]')${key_lower:1}"
-                ;;
-            *)
-                key_formatted="$key_lower"
-                ;;
-        esac
-        ;;
-    l|left)
-        mode="mouse"; button=1; button_name="Left"
-        ;;
-    r|right)
-        mode="mouse"; button=3; button_name="Right"
-        ;;
-    m|middle)
-        mode="mouse"; button=2; button_name="Middle"
-        ;;
-    *)
-        mode="key"
-        key_lower=$(echo "$target_input" | tr '[:upper:]' '[:lower:]')
-        case $key_lower in
-            up|down|left_arrow|right_arrow)
-                key_formatted="$(echo ${key_lower:0:1} | tr '[:lower:]' '[:upper:]')${key_lower:1}"
-                ;;
-            *)
-                key_formatted="$key_lower"
-                ;;
-        esac
-        ;;
+case ${LC_ALL:-${LC_CTYPE:-${LANG:-}}} in
+    *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) ICON_RUN='▶️ '; ICON_PAUSE='⏸️ ' ;;
+    *)                                 ICON_RUN='>';   ICON_PAUSE='||' ;;
 esac
 
-# Get the Caps Lock LED path (works for both modes)
-caps_led=""
-for led in /sys/class/leds/input*::capslock/brightness; do
-    if [ -f "$led" ]; then
-        caps_led="$led"
-        break
-    fi
-done
+have() { command -v "$1" >/dev/null 2>&1; }
 
-# Setup trap for clean exit
-cleanup() {
-    echo ""
-    if [ "$hold_mode" = true ] && [ "$paused" = false ]; then
-        if [ "$mode" = "mouse" ]; then
-            xdotool mouseup "$button"
-            echo "Released $button_name button"
-        else
-            xdotool keyup "$key_formatted" 2>/dev/null
-            echo "Released '$key_formatted' key"
-        fi
-    fi
-    echo "Macro stopped."
-    exit 0
+die() {
+    printf '%s: %s\n' "$PROG" "$*" >&2
+    printf "Try '%s --help' for usage.\n" "$PROG" >&2
+    exit 1
 }
-trap cleanup INT TERM
 
-# Perform / release the action, mode-aware
-perform_action() {
-    if [ "$mode" = "mouse" ]; then
-        if [ "$hold_mode" = true ]; then
-            xdotool mousedown "$button"
-        else
-            xdotool click "$button"
-        fi
-    else
-        if [ "$hold_mode" = true ]; then
-            xdotool keydown "$key_formatted"
-        else
-            xdotool key "$key_formatted"
-        fi
+# ---------------------------------------------------------- backend detect ---
+is_wsl() { [ -r /proc/version ] && grep -qi microsoft /proc/version 2>/dev/null; }
+
+find_ps() {
+    PS=
+    for p in powershell.exe powershell; do
+        if have "$p"; then PS=$p; return 0; fi
+    done
+    return 1
+}
+
+detect_backend() {
+    BACKEND=; BACKEND_ERR=
+    if [ -n "${MACRO_BACKEND:-}" ]; then          # manual override
+        BACKEND=$MACRO_BACKEND
+        [ "$BACKEND" = windows ] && find_ps
+        return
     fi
+    os=$(uname -s 2>/dev/null || echo unknown)
+    case $os in
+        Darwin)
+            if have osascript; then BACKEND=macos
+            else BACKEND_ERR='osascript not found'; fi ;;
+        MINGW*|MSYS*|CYGWIN*)
+            if find_ps; then BACKEND=windows
+            else BACKEND_ERR='powershell not found in PATH'; fi ;;
+        *)
+            if is_wsl && find_ps; then
+                BACKEND=windows
+            elif have xdotool; then
+                BACKEND=xdotool
+            else
+                BACKEND_ERR='xdotool not found (apt/dnf/pacman/zypper/pkg install xdotool)'
+            fi ;;
+    esac
+}
+
+backend_label() {
+    case $BACKEND in
+        xdotool) printf 'Linux/BSD via xdotool' ;;
+        macos)   printf 'macOS via osascript' ;;
+        windows) printf 'Windows via PowerShell' ;;
+        *)       printf '%sunavailable%s - %s' "$Y" "$N" "$BACKEND_ERR" ;;
+    esac
+}
+
+# -------------------------------------------------------------------- help ---
+usage() {
+    cat <<EOF
+${B}${PROG}${N} - auto-click / auto-press / hold, toggled with Caps Lock
+
+${B}USAGE${N}
+  ${PROG} ${C}<target>${N} ${D}[interval|h]${N}
+
+${B}TARGET${N}  ${D}what to send${N}
+  ${C}l${N}, ${C}left${N}          left mouse button
+  ${C}r${N}, ${C}right${N}         right mouse button
+  ${C}m${N}, ${C}middle${N}        middle mouse button
+  ${C}<key>${N}            any keyboard key:
+                     letters, digits, punctuation   a  w  5  ;
+                     space enter tab esc backspace delete
+                     up down left_arrow right_arrow
+                     home end pageup pagedown
+                     shift ctrl alt cmd    f1 .. f12
+  ${C}key:<name>${N}       force key mode for names that collide with the
+                   mouse shortcuts, e.g. key:l  key:r  key:m
+
+${B}INTERVAL${N}  ${D}how to send it (default: 1)${N}
+  ${C}<seconds>${N}        repeat every N seconds, e.g. 2  0.5  0.05
+  ${C}h${N}, ${C}hold${N}          press and keep holding until paused
+
+${B}CONTROLS${N}
+  Caps Lock ON    macro RUNS
+  Caps Lock OFF   macro PAUSES (held keys/buttons are released)
+  Ctrl+C          quit (anything held is released)
+  ${D}It always starts paused - if Caps Lock is already on, toggle it off, then on.${N}
+
+${B}EXAMPLES${N}
+  ${PROG} l 0.1          left-click 10 times per second
+  ${PROG} space 2        tap space every 2 seconds
+  ${PROG} w h            hold W (walk forward)
+  ${PROG} r h            hold the right mouse button
+  ${PROG} key:r 0.5      tap the letter R every half second
+
+${B}NOTES${N}
+  - Caps Lock being on can make the *target app* see capital letters.
+    Games read key codes so it rarely matters; text fields will notice.
+  - macOS: grant your terminal Accessibility permission
+           (System Settings > Privacy & Security > Accessibility).
+  - Linux Wayland: xdotool only reaches XWayland apps.
+  - Set NO_COLOR=1 to disable colors.
+
+${B}BACKEND${N}  $(backend_label)
+EOF
+}
+
+# ------------------------------------------------------------ key mappings ---
+# Fills K_X (xdotool name), K_MAC (macOS key code), K_VK (Windows virtual-key),
+# K_CC (char code for Windows VkKeyScan when K_VK is 0).
+mac_code() {
+    case $1 in
+        a) K_MAC=0;;  s) K_MAC=1;;  d) K_MAC=2;;  f) K_MAC=3;;  h) K_MAC=4;;
+        g) K_MAC=5;;  z) K_MAC=6;;  x) K_MAC=7;;  c) K_MAC=8;;  v) K_MAC=9;;
+        b) K_MAC=11;; q) K_MAC=12;; w) K_MAC=13;; e) K_MAC=14;; r) K_MAC=15;;
+        y) K_MAC=16;; t) K_MAC=17;; 1) K_MAC=18;; 2) K_MAC=19;; 3) K_MAC=20;;
+        4) K_MAC=21;; 6) K_MAC=22;; 5) K_MAC=23;; '=') K_MAC=24;; 9) K_MAC=25;;
+        7) K_MAC=26;; '-') K_MAC=27;; 8) K_MAC=28;; 0) K_MAC=29;; ']') K_MAC=30;;
+        o) K_MAC=31;; u) K_MAC=32;; '[') K_MAC=33;; i) K_MAC=34;; p) K_MAC=35;;
+        l) K_MAC=37;; j) K_MAC=38;; "'") K_MAC=39;; k) K_MAC=40;; ';') K_MAC=41;;
+        '\') K_MAC=42;; ',') K_MAC=43;; '/') K_MAC=44;; n) K_MAC=45;; m) K_MAC=46;;
+        '.') K_MAC=47;; '`') K_MAC=50;;
+    esac
+}
+
+resolve_key() {   # $1 = lower-case name, $2 = name as typed
+    K_X=; K_MAC=; K_VK=0; K_CC=0
+    case $1 in
+        space)        K_X=space;     K_MAC=49;  K_VK=32 ;;
+        enter|return) K_X=Return;    K_MAC=36;  K_VK=13 ;;
+        tab)          K_X=Tab;       K_MAC=48;  K_VK=9  ;;
+        esc|escape)   K_X=Escape;    K_MAC=53;  K_VK=27 ;;
+        backspace)    K_X=BackSpace; K_MAC=51;  K_VK=8  ;;
+        delete|del)   K_X=Delete;    K_MAC=117; K_VK=46 ;;
+        up)           K_X=Up;        K_MAC=126; K_VK=38 ;;
+        down)         K_X=Down;      K_MAC=125; K_VK=40 ;;
+        left_arrow)   K_X=Left;      K_MAC=123; K_VK=37 ;;
+        right_arrow)  K_X=Right;     K_MAC=124; K_VK=39 ;;
+        home)         K_X=Home;      K_MAC=115; K_VK=36 ;;
+        end)          K_X=End;       K_MAC=119; K_VK=35 ;;
+        pageup)       K_X=Prior;     K_MAC=116; K_VK=33 ;;
+        pagedown)     K_X=Next;      K_MAC=121; K_VK=34 ;;
+        shift)        K_X=Shift_L;   K_MAC=56;  K_VK=16 ;;
+        ctrl)         K_X=Control_L; K_MAC=59;  K_VK=17 ;;
+        alt)          K_X=Alt_L;     K_MAC=58;  K_VK=18 ;;
+        cmd|super|win|meta) K_X=Super_L; K_MAC=55; K_VK=91 ;;
+        f[1-9]|f1[0-2])
+            n=${1#f}
+            K_X=F$n; K_VK=$((111 + n))
+            case $n in
+                1) K_MAC=122;; 2) K_MAC=120;; 3) K_MAC=99;;  4) K_MAC=118;;
+                5) K_MAC=96;;  6) K_MAC=97;;  7) K_MAC=98;;  8) K_MAC=100;;
+                9) K_MAC=101;; 10) K_MAC=109;; 11) K_MAC=103;; 12) K_MAC=111;;
+            esac ;;
+        ?)  # single character
+            case $1 in
+                ';') K_X=semicolon;;    ',') K_X=comma;;       '.') K_X=period;;
+                '/') K_X=slash;;        "'") K_X=apostrophe;;  '[') K_X=bracketleft;;
+                ']') K_X=bracketright;; '\') K_X=backslash;;   '-') K_X=minus;;
+                '=') K_X=equal;;        '`') K_X=grave;;
+                *)   K_X=$1;;
+            esac
+            mac_code "$1"
+            K_CC=$(printf '%d' "'$1") ;;
+        *)  # unknown multi-char name: let xdotool try it (any X keysym works)
+            if [ "$BACKEND" = xdotool ]; then K_X=$2; fi ;;
+    esac
+
+    case $BACKEND in
+        xdotool) [ -n "$K_X" ]   || die "unknown key '$2'" ;;
+        macos)   [ -n "$K_MAC" ] || die "unknown key '$2' (not available on macOS)" ;;
+        windows) [ "$K_VK" != 0 ] || [ "$K_CC" != 0 ] || die "unknown key '$2'" ;;
+    esac
+}
+
+# -------------------------------------------------------------- arguments ---
+case ${1:-} in
+    -h|--help|help|-\?) detect_backend; usage; exit 0 ;;
+    '')                 detect_backend; usage; exit 1 ;;
+esac
+
+TARGET=$1
+INTERVAL=${2:-1}
+
+TARGET_LC=$(printf '%s' "$TARGET" | tr '[:upper:]' '[:lower:]')
+INTERVAL_LC=$(printf '%s' "$INTERVAL" | tr '[:upper:]' '[:lower:]')
+
+HOLD=0
+case $INTERVAL_LC in
+    h|hold) HOLD=1; INTERVAL=1 ;;
+    ''|.|*[!0-9.]*|*.*.*) die "invalid interval '$INTERVAL' (use seconds like 0.5, or 'h' to hold)" ;;
+    *) awk -v i="$INTERVAL" 'BEGIN{exit !(i >= 0.01)}' || die "interval must be at least 0.01 seconds" ;;
+esac
+
+KIND=key; BTN=none; LABEL=
+case $TARGET_LC in
+    key:*)    KEY_LC=${TARGET_LC#key:}; KEY_RAW=${TARGET#[Kk][Ee][Yy]:} ;;
+    l|left)   KIND=mouse; BTN=left;   LABEL='left mouse button'   ;;
+    r|right)  KIND=mouse; BTN=right;  LABEL='right mouse button'  ;;
+    m|middle) KIND=mouse; BTN=middle; LABEL='middle mouse button' ;;
+    *)        KEY_LC=$TARGET_LC; KEY_RAW=$TARGET ;;
+esac
+
+detect_backend
+[ -n "$BACKEND" ] || die "no input backend: $BACKEND_ERR"
+case $BACKEND in xdotool|macos|windows) ;; *) die "unknown MACRO_BACKEND '$BACKEND'" ;; esac
+
+if [ "$KIND" = key ]; then
+    [ -n "$KEY_LC" ] || die "empty key name"
+    resolve_key "$KEY_LC" "$KEY_RAW"
+    LABEL="key '$KEY_LC'"
+fi
+
+# ------------------------------------------------------------ timing setup ---
+TICK=0.05
+sleep 0.01 2>/dev/null || TICK=1          # very old sleep(1): whole seconds only
+CAPS_SRC=
+
+# ---------------------------------------------------- backend: xdotool -------
+x_check() {
+    [ -n "${DISPLAY:-}" ] || die "no X display (DISPLAY is empty). Are you in a graphical session?"
+}
+x_mouse_down() { xdotool mousedown "$1"; }
+x_mouse_up()   { xdotool mouseup "$1"; }
+x_click()      { xdotool click "$1"; }
+x_key_down()   { xdotool keydown "$1"; }
+x_key_up()     { xdotool keyup "$1" 2>/dev/null; }
+x_tap()        { xdotool key "$1"; }
+
+# ---------------------------------------------------- backend: macOS ---------
+mac_check() { :; }
+# $1 = button index (0 left, 1 right, 2 middle), $2 = comma list of event types
+mac_mouse() {
+    osascript -l JavaScript -e 'ObjC.import("ApplicationServices");var p=$.CGEventGetLocation($.CGEventCreate(null));['"$2"'].forEach(function(t){$.CGEventPost(0,$.CGEventCreateMouseEvent(null,t,p,'"$1"'));$.usleep(15000);});' >/dev/null
+}
+# $1 = key code, $2 = "true,false" (tap) | "true" (down) | "false" (up)
+mac_key() {
+    osascript -l JavaScript -e 'ObjC.import("ApplicationServices");['"$2"'].forEach(function(d){$.CGEventPost(0,$.CGEventCreateKeyboardEvent(null,'"$1"',d));$.usleep(15000);});' >/dev/null
+}
+mac_btn_idx()  { case $BTN in left) M_IDX=0; M_DN=1;  M_UP=2;;  right) M_IDX=1; M_DN=3; M_UP=4;; middle) M_IDX=2; M_DN=25; M_UP=26;; esac; }
+
+# -------------------------------------------------- Caps Lock state reader ---
+# Sets CAPS to 1 (on) or 0 (off).
+caps_setup() {
+    case $BACKEND in
+        macos)   CAPS_SRC=mac;  [ "$TICK" = 0.05 ] && TICK=0.1 ;;
+        windows) CAPS_SRC=win ;;
+        *)
+            CAPS_LEDS=
+            for f in /sys/class/leds/*capslock/brightness; do
+                [ -r "$f" ] && CAPS_LEDS="$CAPS_LEDS $f"
+            done
+            if [ -n "$CAPS_LEDS" ]; then
+                CAPS_SRC=led                           # cheap: no process spawn
+            elif have xset; then
+                CAPS_SRC=xset; [ "$TICK" = 0.05 ] && TICK=0.1
+            else
+                die "cannot read Caps Lock state (no /sys/class/leds/*capslock and no xset)"
+            fi ;;
+    esac
+}
+
+caps_poll() {
+    case $CAPS_SRC in
+        led)
+            CAPS=0
+            for f in $CAPS_LEDS; do
+                v=0; read -r v <"$f" 2>/dev/null
+                [ "${v:-0}" != 0 ] && CAPS=1
+            done ;;
+        xset)
+            if xset q 2>/dev/null | grep -q 'Caps Lock: *on'; then CAPS=1; else CAPS=0; fi ;;
+        mac)
+            CAPS=$(osascript -l JavaScript -e 'ObjC.import("ApplicationServices");($.CGEventSourceFlagsState(1)&0x10000)?1:0' 2>/dev/null)
+            CAPS=${CAPS:-0} ;;
+    esac
+}
+
+# ------------------------------------------------- generic action layer ------
+sent=0
+
+do_action() {
+    sent=$((sent + 1))
+    case $BACKEND in
+        xdotool)
+            if [ "$KIND" = mouse ]; then
+                case $BTN in left) b=1;; middle) b=2;; right) b=3;; esac
+                if [ $HOLD = 1 ]; then x_mouse_down "$b"; else x_click "$b"; fi
+            else
+                if [ $HOLD = 1 ]; then x_key_down "$K_X"; else x_tap "$K_X"; fi
+            fi ;;
+        macos)
+            if [ "$KIND" = mouse ]; then
+                mac_btn_idx
+                if [ $HOLD = 1 ]; then mac_mouse "$M_IDX" "$M_DN"; else mac_mouse "$M_IDX" "$M_DN,$M_UP"; fi
+            else
+                if [ $HOLD = 1 ]; then mac_key "$K_MAC" true; else mac_key "$K_MAC" true,false; fi
+            fi ;;
+    esac
 }
 
 release_action() {
-    if [ "$hold_mode" = true ]; then
-        if [ "$mode" = "mouse" ]; then
-            xdotool mouseup "$button"
-        else
-            xdotool keyup "$key_formatted"
-        fi
-    fi
+    [ $HOLD = 1 ] || return 0
+    case $BACKEND in
+        xdotool)
+            if [ "$KIND" = mouse ]; then
+                case $BTN in left) b=1;; middle) b=2;; right) b=3;; esac
+                x_mouse_up "$b"
+            else
+                x_key_up "$K_X"
+            fi ;;
+        macos)
+            if [ "$KIND" = mouse ]; then mac_btn_idx; mac_mouse "$M_IDX" "$M_UP"
+            else mac_key "$K_MAC" false; fi ;;
+    esac
 }
 
-if [ "$mode" = "mouse" ]; then
-    if [ "$hold_mode" = true ]; then
-        echo "HOLDING '$button_name' button down..."
+stamp() { date '+%H:%M:%S'; }
+
+# ---------------------------------------------------------------- cleanup ---
+CLEANED=0; running=0; WIN_DIR=; WIN_FILE=
+
+cleanup() {
+    [ "$CLEANED" = 1 ] && return
+    CLEANED=1
+    printf '\n'
+    if [ "$BACKEND" = windows ]; then
+        # PowerShell may have died before its own 'finally' ran - release again.
+        [ $HOLD = 1 ] && [ -n "$WIN_FILE" ] && run_ps -ReleaseOnly 1 >/dev/null 2>&1
+        [ -n "$WIN_DIR" ] && rm -rf "$WIN_DIR"
+        printf 'Macro stopped.\n'
     else
-        echo "Clicking '$button_name' button every ${sleep_time} second(s)..."
+        [ "$running" = 1 ] && release_action
+        printf 'Macro stopped. (%s action(s) sent)\n' "$sent"
     fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+# ---------------------------------------------------------------- banner ----
+if [ $HOLD = 1 ]; then
+    printf '%sHolding%s %s\n' "$B" "$N" "$LABEL"
 else
-    if [ "$hold_mode" = true ]; then
-        echo "Holding '$key_formatted' key..."
-    else
-        echo "Pressing '$key_formatted' every ${sleep_time} second(s)..."
-    fi
+    printf '%sRepeating%s %s every %ss\n' "$B" "$N" "$LABEL" "$INTERVAL"
 fi
-echo "----------------------------------------"
-echo "CAPS LOCK ON  = Macro RUNNING ▶️"
-echo "CAPS LOCK OFF = Macro PAUSED ⏸️"
-echo "Press Ctrl+C to completely stop"
-echo "----------------------------------------"
+printf '  Caps Lock ON  = running   |   OFF = paused   |   Ctrl+C = quit\n'
+printf '  backend: %s\n' "$(backend_label)"
+printf '%s\n' '----------------------------------------------------------------'
 
-paused=true
+# =====================================================================
+#  Windows: one PowerShell process runs the whole loop (spawning
+#  PowerShell per click would be far too slow).
+# =====================================================================
+run_ps() {
+    "$PS" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$WIN_FILE" \
+        -Kind "$KIND" -Btn "$BTN" -Vk "$K_VK" -Cc "$K_CC" -Hold "$HOLD" -Ms "$MS" "$@"
+}
 
-run_loop() {
-    local use_led=$1  # true/false
-    local prev_state=$2
+run_windows() {
+    MS=$(awk -v i="$INTERVAL" 'BEGIN{printf "%d", i*1000}')
+    if is_wsl; then
+        wt=$(cd /mnt/c 2>/dev/null; "$PS" -NoProfile -Command '[IO.Path]::GetTempPath()' | tr -d '\r')
+        WIN_DIR=$(wslpath -u "$wt")
+        WIN_FILE="${wt}macro-$$.ps1"
+        ps_file="$WIN_DIR/macro-$$.ps1"
+    else
+        WIN_DIR=$(mktemp -d 2>/dev/null || echo "${TMPDIR:-/tmp}/macro.$$")
+        mkdir -p "$WIN_DIR"
+        ps_file="$WIN_DIR/macro.ps1"
+        WIN_FILE=$(cygpath -w "$ps_file" 2>/dev/null || printf '%s' "$ps_file")
+    fi
 
-    while true; do
-        if [ "$use_led" = true ]; then
-            caps_state=$(cat "$caps_led" 2>/dev/null || echo "0")
-            on_value="1"
-        else
-            if command -v xset >/dev/null 2>&1; then
-                caps_state=$(xset q 2>/dev/null | grep "Caps Lock:" | awk '{print $4}')
+    cat >"$ps_file" <<'PSEOF'
+param([string]$Kind,[string]$Btn,[int]$Vk,[int]$Cc,[int]$Hold,[int]$Ms,[int]$ReleaseOnly=0)
+Add-Type -Namespace M -Name U -MemberDefinition '
+[DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+[DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
+[DllImport("user32.dll")] public static extern short GetKeyState(int vk);
+[DllImport("user32.dll")] public static extern short VkKeyScan(char ch);'
+$Z=[UIntPtr]::Zero
+if($Kind -eq 'key' -and $Vk -le 0){ $Vk = [M.U]::VkKeyScan([char]$Cc) -band 255 }
+$Ext = if(($Vk -ge 33 -and $Vk -le 40) -or $Vk -eq 45 -or $Vk -eq 46){1}else{0}
+$Dn=@{left=2;right=8;middle=32}; $Up=@{left=4;right=16;middle=64}
+function Press   { if($Kind -eq 'mouse'){[M.U]::mouse_event($Dn[$Btn],0,0,0,$Z)}else{[M.U]::keybd_event([byte]$Vk,0,$Ext,$Z)} }
+function Release { if($Kind -eq 'mouse'){[M.U]::mouse_event($Up[$Btn],0,0,0,$Z)}else{[M.U]::keybd_event([byte]$Vk,0,($Ext -bor 2),$Z)} }
+function Fire    { Press; if($Hold -eq 0){ Start-Sleep -Milliseconds 15; Release } }
+function Stamp   { (Get-Date).ToString('HH:mm:ss') }
+if($ReleaseOnly){ Release; exit }
+$on=$false; $n=0
+$prev=([M.U]::GetKeyState(0x14) -band 1) -eq 1
+$sw=[Diagnostics.Stopwatch]::StartNew(); $next=0
+try{
+  while($true){
+    $caps=([M.U]::GetKeyState(0x14) -band 1) -eq 1
+    if($caps -ne $prev){
+      $prev=$caps; $on=$caps
+      if($on){ Write-Host "$(Stamp) - RUNNING"; Fire; $n++; $next=$sw.ElapsedMilliseconds+$Ms }
+      else   { Write-Host "$(Stamp) - PAUSED"; if($Hold){Release} }
+    }
+    if($on -and $Hold -eq 0 -and $sw.ElapsedMilliseconds -ge $next){ Fire; $n++; $next=$sw.ElapsedMilliseconds+$Ms }
+    Start-Sleep -Milliseconds 20
+  }
+} finally {
+  if($on -and $Hold -eq 1){ Release }
+  Write-Host "($n action(s) sent)"
+}
+PSEOF
+
+    printf '%s  PAUSED - toggle Caps Lock on to start\n' "$(stamp)"
+    run_ps
+}
+
+# =====================================================================
+#  Linux / macOS: the loop lives here, in shell.
+# =====================================================================
+run_shell_loop() {
+    case $BACKEND in xdotool) x_check ;; macos) mac_check ;; esac
+    caps_setup
+
+    # tick = poll period; never coarser than the interval itself
+    TICK=$(awk -v i="$INTERVAL" -v t="$TICK" 'BEGIN{ if (i < t) t = i; printf "%.3f", t }')
+    TICKS=$(awk -v i="$INTERVAL" -v t="$TICK" 'BEGIN{ n = int(i / t + 0.5); if (n < 1) n = 1; print n }')
+
+    caps_poll; prev=$CAPS
+    if [ "$prev" = 1 ]; then
+        printf '%s  Caps Lock is already ON - toggle it off, then on, to start\n' "$(stamp)"
+    else
+        printf '%s  %s PAUSED - toggle Caps Lock on to start\n' "$(stamp)" "$ICON_PAUSE"
+    fi
+
+    count=0
+    while :; do
+        caps_poll
+        if [ "$CAPS" != "$prev" ]; then
+            prev=$CAPS
+            if [ "$CAPS" = 1 ]; then
+                running=1; count=0
+                printf '%s  %s RUNNING\n' "$(stamp)" "$ICON_RUN"
+                do_action
             else
-                caps_state="off"
-            fi
-            on_value="on"
-        fi
-
-        if [ "$caps_state" != "$prev_state" ]; then
-            prev_state="$caps_state"
-            if [ "$caps_state" = "$on_value" ]; then
-                echo "$(date '+%H:%M:%S') - ▶️  RESUMED - Macro RUNNING"
-                paused=false
-                perform_action
-            else
-                echo "$(date '+%H:%M:%S') - ⏸️  PAUSED - Macro PAUSED"
-                paused=true
+                running=0
+                printf '%s  %s PAUSED\n' "$(stamp)" "$ICON_PAUSE"
                 release_action
             fi
         fi
-
-        if [ "$paused" = false ] && [ "$hold_mode" = false ]; then
-            perform_action
+        if [ "$running" = 1 ] && [ $HOLD = 0 ]; then
+            count=$((count + 1))
+            if [ "$count" -ge "$TICKS" ]; then
+                do_action; count=0
+            fi
         fi
-
-        if [ "$hold_mode" = false ]; then
-            sleep "$sleep_time"
-        else
-            sleep 0.1
-        fi
+        sleep "$TICK"
     done
 }
 
-if [ -z "$caps_led" ]; then
-    echo "Warning: Cannot find Caps Lock LED. Using fallback method (polling xset)..."
-    run_loop false "off"
+if [ "$BACKEND" = windows ]; then
+    [ -n "${PS:-}" ] || find_ps || die "powershell not found"
+    run_windows
 else
-    echo "$(date '+%H:%M:%S') - ⏸️  PAUSED - Press Caps Lock to start"
-    run_loop true "$(cat "$caps_led")"
+    run_shell_loop
 fi

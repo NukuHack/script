@@ -21,7 +21,6 @@ Python basics.
 | `img_saver` | Save images from clipboard. |
 | `img_viewer` | Flip through images easily. |
 | `mc_server` | All-in-one MC client for a server. *(for a game)* |
-| `macro` | *(test)* Making the shell macro OS-independent. |
 | `memory_check` | Check a process's used memory. |
 | `music` | Download stuff from YouTube. *(broken)* |
 | `screen` | See what changed on your screen. |

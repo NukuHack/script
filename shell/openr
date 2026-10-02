@@ -4,17 +4,37 @@
 # --- resolve our own directory, robustly ---
 self=$0
 case "$self" in
-    */*) : ;;                          # has a path component
-    *)   self=$(command -v -- "$self") # invoked via $PATH; ask the shell
-         ;;
+    */*) : ;;
+    *)   self=$(command -v -- "$self") ;;
 esac
 dir=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd) || exit 1
 
 # --- read the two key fragments (concatenated), safely ---
 key=$(cat -- "$dir/idk.txt")$(cat -- "$dir/idk2.txt")
 
-# --- exec chat.sh with everything properly quoted ---
-exec "$dir/chat.sh" \
-    -k "$key" \
-    -m 'deepseek/deepseek-chat-v3.1' \
-    "$@"
+MODEL='deepseek/deepseek-chat-v3.1'
+
+# --- If the first argument is a file, embed its contents in the prompt ---
+if [ -f "$1" ]; then
+    file=$1
+    shift
+    if [ "$#" -gt 0 ]; then
+        question="$*"
+    else
+        question=$(cat)          # question came in on stdin (pipe)
+    fi
+    prompt="Contents of $file:
+---
+$(cat -- "$file")
+---
+
+$question"
+    exec "$dir/chat.sh" -k "$key" -m "$MODEL" "$prompt"
+fi
+
+# --- No file arg: just forward everything ---
+if [ "$#" -gt 0 ]; then
+    exec "$dir/chat.sh" -k "$key" -m "$MODEL" "$@"
+else
+    exec "$dir/chat.sh" -k "$key" -m "$MODEL" "$(cat)"
+fi

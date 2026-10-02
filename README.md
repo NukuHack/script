@@ -17,7 +17,6 @@ Python basics.
 
 | Project | Description |
 |---|---|
-| `doc_to_txt` | Convert *all* documents to html (text) |
 | `img_saver` | Save images from clipboard. |
 | `img_viewer` | Flip through images easily. |
 | `mc_server` | All-in-one MC client for a server. *(for a game)* |

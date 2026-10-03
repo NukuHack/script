@@ -1,4 +1,5 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python2
+# -*- coding: utf-8 -*-
 """
 csharp_to_stuki.py
 -------------------
@@ -38,17 +39,24 @@ Scope / honesty about limits:
     unrecognized is kept as a literal statement line rather than crashing.
 
 Usage:
-  python3 csharp_to_stuki.py path/to/Program.cs
-  python3 csharp_to_stuki.py < Program.cs
-  python3 csharp_to_stuki.py            # runs a built-in demo (2 methods)
+  python2 csharp_to_stuki.py path/to/Program.cs
+  python2 csharp_to_stuki.py < Program.cs
+  python2 csharp_to_stuki.py            # runs a built-in demo (2 methods)
 """
+from __future__ import print_function
+
 import sys
 import re
+import io
 import json
 import gzip
 import base64
 import random
-import urllib.parse
+
+try:                                   # Python 3 (kept working too)
+    from urllib.parse import quote
+except ImportError:                    # Python 2.7
+    from urllib import quote
 
 BASE62 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
@@ -116,7 +124,7 @@ def find_matching(s, open_idx):
                 if depth == 0:
                     return i
         i += 1
-    raise ValueError(f"Unbalanced {open_ch!r} starting at {open_idx}")
+    raise ValueError("Unbalanced %r starting at %d" % (open_ch, open_idx))
 
 
 def find_stmt_end(s, i, limit):
@@ -224,10 +232,10 @@ def match_word(s, i, word):
 
 BUILTIN_NUMERIC = r"(?:int|uint|long|ulong|short|ushort|byte|sbyte|double|float|decimal|bool|char)"
 PARSE_WRAPPER_RE = re.compile(
-    rf"\b{BUILTIN_NUMERIC}\.Parse\s*\("
+    r"\b" + BUILTIN_NUMERIC + r"\.Parse\s*\("
     r"|\bConvert\.To(?:Int32|Int64|Int16|Byte|SByte|UInt32|UInt64|UInt16|Double|Single|Decimal|Boolean|Char|String)\s*\("
 )
-TRYPARSE_QUALIFIER_RE = re.compile(rf"\b{BUILTIN_NUMERIC}\.TryParse\b")
+TRYPARSE_QUALIFIER_RE = re.compile(r"\b" + BUILTIN_NUMERIC + r"\.TryParse\b")
 REF_OUT_IN_RE = re.compile(r"\b(?:ref|out|in)\s+(?=[A-Za-z_])")
 CONSOLE_WRITE_RE = re.compile(r"^Console(?:\.Out|\.Error)?\.(WriteLine|Write)\s*\(")
 CONSOLE_READ_RE = re.compile(r"^Console\.(ReadLine|Read|ReadKey)\s*\(")
@@ -281,7 +289,7 @@ def simplify_stmt(text):
         span = _whole_call_span(text, m)
         if span:
             inner = simplify_generic(text[span[0] + 1:span[1]].strip())
-            return f"out {inner}" if inner else "out"
+            return "out " + inner if inner else "out"
 
     m = CONSOLE_READ_RE.match(text)
     if m and _whole_call_span(text, m):
@@ -294,7 +302,7 @@ def simplify_stmt(text):
         target, rhs = m.group(1), m.group(2).strip()
         m2 = CONSOLE_READ_RE.match(rhs)
         if m2 and _whole_call_span(rhs, m2):
-            return f"inp {target}"
+            return "inp " + target
 
     return simplified
 
@@ -307,7 +315,7 @@ def simplify_cond(text):
 # Phase 1: scan C# source -> lightweight python AST (per method)
 # ---------------------------------------------------------------------------
 
-class MethodBodyParser:
+class MethodBodyParser(object):
     """Parses ONE method body (statements only - the signature has already
     been located by find_all_methods)."""
 
@@ -328,7 +336,7 @@ class MethodBodyParser:
                 typ, name = tokens
             else:
                 typ, name = "var", tokens[0]
-            self.variables.append(f"{name.strip()} : {typ.strip()}")
+            self.variables.append("%s : %s" % (name.strip(), typ.strip()))
 
     def parse_statements(self, s, i, limit, top_level=False):
         items = []
@@ -382,7 +390,7 @@ class MethodBodyParser:
             if top_level and s[new_pos:limit].strip() == "":
                 self.pending_return = expr
                 return [], new_pos
-            text = f"return {expr}" if expr else "return"
+            text = "return " + expr if expr else "return"
             return [{"kind": "stmt", "text": text}], new_pos
         # plain statement / declaration
         semi = find_stmt_end(s, pos, limit)
@@ -418,9 +426,9 @@ class MethodBodyParser:
             if not re.match(r"^[A-Za-z_]\w*$", name):
                 return [], False
             any_valid = True
-            self.variables.append(f"{name} : {typ}")
+            self.variables.append("%s : %s" % (name, typ))
             if expr is not None:
-                items.append({"kind": "stmt", "text": simplify_stmt(f"{name} = {expr}")})
+                items.append({"kind": "stmt", "text": simplify_stmt("%s = %s" % (name, expr))})
         return (items, True) if any_valid else ([], False)
 
     def parse_if(self, s, pos, limit):
@@ -513,7 +521,7 @@ class MethodBodyParser:
         raw_cases = self.parse_switch_body(s, pos + 1, close_brace)
         cases = []
         for c in raw_cases:
-            cond = f"{expr} == {c['cond']}" if c["type"] == "case" else None
+            cond = "%s == %s" % (expr, c["cond"]) if c["type"] == "case" else None
             cases.append({"type": c["type"], "cond": cond, "body": {"kind": "seq", "items": c["items"]}})
         return {"kind": "switch", "cases": cases}, close_brace + 1
 
@@ -530,8 +538,8 @@ class MethodBodyParser:
             else:
                 cond = " or ".join(c for _, c in pending)
                 cases.append({"type": "case", "cond": cond, "items": current_items[:]})
-            pending.clear()
-            current_items.clear()
+            del pending[:]
+            del current_items[:]
 
         pos = i
         while True:
@@ -621,7 +629,7 @@ def find_all_methods(src):
 # Phase 2: python AST -> the app's own flat node-map format
 # ---------------------------------------------------------------------------
 
-class NodeBuilder:
+class NodeBuilder(object):
     def __init__(self):
         self.nodes = {}
 
@@ -679,7 +687,7 @@ class NodeBuilder:
                 case_list.append(entry)
             self.nodes[nid] = {"id": nid, "parentId": parent_id, "hidden": False, "type": "switch", "cases": case_list}
             return nid
-        raise ValueError(f"unknown ast kind {k!r}")
+        raise ValueError("unknown ast kind %r" % (k,))
 
 
 # ---------------------------------------------------------------------------
@@ -701,7 +709,7 @@ def variables_to_html(vars_list):
     first, rest = vars_list[0], vars_list[1:]
     html = esc(first)
     for v in rest:
-        html += f"<div>{esc(v)}</div>"
+        html += "<div>%s</div>" % esc(v)
     return html
 
 
@@ -741,9 +749,14 @@ def csharp_source_to_state(source):
 
 def state_to_url(state, base="https://progalap.elte.hu/stuki/v1/"):
     json_str = json.dumps(state, separators=(",", ":"))
-    gz = gzip.compress(json_str.encode("utf-8"), mtime=0)
-    b64 = base64.b64encode(gz).decode("ascii")
-    encoded = urllib.parse.quote(b64, safe="")
+    buf = io.BytesIO()
+    f = gzip.GzipFile(fileobj=buf, mode="wb", mtime=0)
+    try:
+        f.write(json_str.encode("utf-8"))
+    finally:
+        f.close()
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    encoded = quote(b64.encode("ascii"), safe="")
     return base + "?data=" + encoded
 
 
@@ -780,16 +793,18 @@ public class Program
 
 def main():
     if len(sys.argv) > 1:
-        with open(sys.argv[1], "r", encoding="utf-8") as f:
+        with io.open(sys.argv[1], "r", encoding="utf-8") as f:
             source = f.read()
     elif not sys.stdin.isatty():
         source = sys.stdin.read()
+        if isinstance(source, bytes):
+            source = source.decode("utf-8")
     else:
         source = DEMO_SOURCE
         print("(no input given, using built-in demo: Main + Fibonacci)\n", file=sys.stderr)
 
     url, state = csharp_source_to_url(source)
-    print(f"parsed {len(state['structograms'])} method(s): "
+    print("parsed %d method(s): " % len(state["structograms"])
           + ", ".join(sg["name"] for sg in state["structograms"]), file=sys.stderr)
     print(url)
 

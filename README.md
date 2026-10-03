@@ -52,4 +52,5 @@ Python basics.
 | `combine` | A simple cimbiner (folders to txt). |
 | `build` | A basic rust run script |
 | `cleanup` | A small script for cleaning out old files|
+| `run` | A small script to run c source files, or a single function |
 

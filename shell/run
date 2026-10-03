@@ -1,0 +1,52 @@
+#!/bin/bash
+set -e
+
+if [ $# -lt 1 ]; then
+    cat >&2 <<'USAGE'
+Usage: run.sh INPUT [FUNCTION]
+
+  INPUT     C source file to compile.
+  FUNCTION  Optional. If given, the file's own main (if any) is renamed
+            out of the way and a tiny driver calls FUNCTION() instead.
+            Works for both 'void FUNCTION(void)' and 'int FUNCTION(void)'.
+
+Binary is built in a temp dir and removed when this script exits.
+USAGE
+    exit 1
+fi
+
+INPUT="$1"
+FUNCTION="$2"
+
+TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR"' EXIT
+
+BIN="$TMPDIR/a.out"
+
+if [ -n "$FUNCTION" ]; then
+    echo "Compiling $INPUT (entry: $FUNCTION) -> temp binary"
+
+    cat > "$TMPDIR/driver.c" <<EOF
+/* auto-generated driver: calls $FUNCTION() as the entry point */
+extern void $FUNCTION(void);
+
+int main(void) {
+    $FUNCTION();
+    return 0;
+}
+EOF
+
+    gcc -c "$INPUT"            -o "$TMPDIR/input.o"  \
+        -Dmain=__unused_main__ \
+        -W -Wall -Wextra -pedantic
+
+    gcc -c "$TMPDIR/driver.c"  -o "$TMPDIR/driver.o" \
+        -W -Wall -Wextra -pedantic
+
+    gcc "$TMPDIR/input.o" "$TMPDIR/driver.o" -o "$BIN"
+else
+    echo "Compiling $INPUT -> temp binary"
+    gcc "$INPUT" -o "$BIN" -W -Wall -Wextra -pedantic
+fi
+
+"$BIN"

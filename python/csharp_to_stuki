@@ -237,8 +237,13 @@ PARSE_WRAPPER_RE = re.compile(
 )
 TRYPARSE_QUALIFIER_RE = re.compile(r"\b" + BUILTIN_NUMERIC + r"\.TryParse\b")
 REF_OUT_IN_RE = re.compile(r"\b(?:ref|out|in)\s+(?=[A-Za-z_])")
-CONSOLE_WRITE_RE = re.compile(r"^Console(?:\.Out|\.Error)?\.(WriteLine|Write)\s*\(")
-CONSOLE_READ_RE = re.compile(r"^Console\.(ReadLine|Read|ReadKey)\s*\(")
+CONSOLE_WRITE_RE = re.compile(r"^Console(\.Out|\.Error)?\.(?:WriteLine|Write)\s*\(")
+# Console stream references inside expressions -> STDIN / STDOUT / STDERR
+CONSOLE_IN_CALL_RE = re.compile(r"\bConsole\s*\.\s*(?:In\s*\.\s*)?(?:ReadLine|Read|ReadKey)\s*\([^()]*\)")
+CONSOLE_IN_RE = re.compile(r"\bConsole\s*\.\s*In\b")
+CONSOLE_OUT_RE = re.compile(r"\bConsole\s*\.\s*Out\b")
+CONSOLE_ERR_RE = re.compile(r"\bConsole\s*\.\s*Error\b")
+CONSOLE_READ_RE = re.compile(r"^Console(?:\.In)?\.(ReadLine|Read|ReadKey)\s*\(")
 ASSIGN_RE = re.compile(r"^([A-Za-z_]\w*(?:\[[^\]]*\])?)\s*=\s*(.+)$", re.S)
 
 
@@ -259,11 +264,23 @@ def strip_parse_wrappers(text):
     return text
 
 
-def simplify_generic(text):
-    """Applies to BOTH statement text and condition text."""
+def replace_console_streams(text):
+    text = CONSOLE_IN_CALL_RE.sub("STDIN", text)
+    text = CONSOLE_IN_RE.sub("STDIN", text)
+    text = CONSOLE_OUT_RE.sub("STDOUT", text)
+    text = CONSOLE_ERR_RE.sub("STDERR", text)
+    return text
+
+
+def simplify_generic(text, console=True):
+    """Applies to BOTH statement text and condition text.
+    console=False leaves Console.* alone (simplify_stmt needs to see
+    `x = Console.ReadLine()` before it turns into STDIN)."""
     text = strip_parse_wrappers(text)
     text = TRYPARSE_QUALIFIER_RE.sub("TryParse", text)
     text = REF_OUT_IN_RE.sub("", text)
+    if console:
+        text = replace_console_streams(text)
     return text.strip()
 
 
@@ -289,13 +306,14 @@ def simplify_stmt(text):
         span = _whole_call_span(text, m)
         if span:
             inner = simplify_generic(text[span[0] + 1:span[1]].strip())
-            return "out " + inner if inner else "out"
+            prefix = "STDERR.out" if m.group(1) == ".Error" else "out"
+            return prefix + " " + inner if inner else prefix
 
     m = CONSOLE_READ_RE.match(text)
     if m and _whole_call_span(text, m):
         return "inp"
 
-    simplified = simplify_generic(text)
+    simplified = simplify_generic(text, console=False)
 
     m = ASSIGN_RE.match(simplified)
     if m:
@@ -304,7 +322,7 @@ def simplify_stmt(text):
         if m2 and _whole_call_span(rhs, m2):
             return "inp " + target
 
-    return simplified
+    return replace_console_streams(simplified).strip()
 
 
 def simplify_cond(text):
@@ -323,6 +341,13 @@ class MethodBodyParser(object):
         self.variables = []       # "name : Type" strings, in declared order
         self.pending_return = None
 
+    def add_variable(self, name, typ):
+        """Record a variable once; repeated declarations (e.g. `int i` in
+        several sibling for-loops) collapse into a single entry."""
+        entry = "%s : %s" % (name, typ)
+        if entry not in self.variables:
+            self.variables.append(entry)
+
     def parse_params(self, params_str):
         for p in split_top_level(params_str, ","):
             p = p.strip()
@@ -336,7 +361,7 @@ class MethodBodyParser(object):
                 typ, name = tokens
             else:
                 typ, name = "var", tokens[0]
-            self.variables.append("%s : %s" % (name.strip(), typ.strip()))
+            self.add_variable(name.strip(), typ.strip())
 
     def parse_statements(self, s, i, limit, top_level=False):
         items = []
@@ -426,7 +451,7 @@ class MethodBodyParser(object):
             if not re.match(r"^[A-Za-z_]\w*$", name):
                 return [], False
             any_valid = True
-            self.variables.append("%s : %s" % (name, typ))
+            self.add_variable(name, typ)
             if expr is not None:
                 items.append({"kind": "stmt", "text": simplify_stmt("%s = %s" % (name, expr))})
         return (items, True) if any_valid else ([], False)

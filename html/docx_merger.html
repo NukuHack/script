@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DOCX Merger – Combine Two Word Files</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        body {
+            font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f7fa;
+            color: #1e293b;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            padding: 1.5rem;
+        }
+        .card {
+            background: #ffffff;
+            border-radius: 1rem;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.08), 0 6px 12px rgba(0, 0, 0, 0.05);
+            max-width: 540px;
+            width: 100%;
+            padding: 2rem 2rem 2.25rem;
+        }
+        h1 {
+            font-size: 1.6rem;
+            font-weight: 600;
+            letter-spacing: -0.02em;
+            margin-bottom: 0.35rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        h1 span {
+            background: #2563eb;
+            color: white;
+            font-size: 0.85rem;
+            font-weight: 500;
+            padding: 0.2rem 0.65rem;
+            border-radius: 100px;
+            letter-spacing: 0.01em;
+        }
+        .subtitle {
+            color: #64748b;
+            font-size: 0.95rem;
+            margin-bottom: 1.75rem;
+            line-height: 1.5;
+        }
+        .file-group {
+            margin-bottom: 1.25rem;
+        }
+        .file-group label {
+            display: block;
+            font-weight: 500;
+            font-size: 0.9rem;
+            margin-bottom: 0.4rem;
+            color: #334155;
+        }
+        .file-group label small {
+            font-weight: 400;
+            color: #94a3b8;
+            margin-left: 0.4rem;
+        }
+        input[type="file"] {
+            width: 100%;
+            padding: 0.65rem 0.9rem;
+            border: 1.5px dashed #cbd5e1;
+            border-radius: 0.6rem;
+            background: #f8fafc;
+            font-size: 0.9rem;
+            color: #1e293b;
+            cursor: pointer;
+            transition: border-color 0.15s, background 0.15s;
+        }
+        input[type="file"]:hover {
+            border-color: #2563eb;
+            background: #eff6ff;
+        }
+        input[type="file"]:focus-visible {
+            outline: 2px solid #2563eb;
+            outline-offset: 2px;
+        }
+        button {
+            width: 100%;
+            padding: 0.85rem 1.5rem;
+            border: none;
+            border-radius: 0.6rem;
+            font-size: 1rem;
+            font-weight: 600;
+            background: #2563eb;
+            color: #ffffff;
+            cursor: pointer;
+            transition: background 0.15s, transform 0.1s, box-shadow 0.15s;
+            margin-top: 0.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+        button:hover:not(:disabled) {
+            background: #1d4ed8;
+            box-shadow: 0 8px 16px rgba(37, 99, 235, 0.25);
+        }
+        button:active:not(:disabled) {
+            transform: scale(0.98);
+        }
+        button:disabled {
+            background: #94a3b8;
+            cursor: not-allowed;
+            opacity: 0.8;
+        }
+        .status {
+            margin-top: 1.25rem;
+            padding: 0.75rem 1rem;
+            border-radius: 0.6rem;
+            font-size: 0.9rem;
+            line-height: 1.5;
+            display: none;
+            word-break: break-word;
+        }
+        .status.info {
+            display: block;
+            background: #eff6ff;
+            color: #1e40af;
+            border: 1px solid #bfdbfe;
+        }
+        .status.success {
+            display: block;
+            background: #f0fdf4;
+            color: #166534;
+            border: 1px solid #bbf7d0;
+        }
+        .status.error {
+            display: block;
+            background: #fef2f2;
+            color: #991b1b;
+            border: 1px solid #fecaca;
+        }
+        .download-link {
+            display: none;
+            margin-top: 1rem;
+            text-align: center;
+        }
+        .download-link a {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            color: #2563eb;
+            font-weight: 600;
+            text-decoration: none;
+            font-size: 0.95rem;
+            padding: 0.6rem 1.2rem;
+            border-radius: 0.5rem;
+            background: #eff6ff;
+            transition: background 0.15s;
+        }
+        .download-link a:hover {
+            background: #dbeafe;
+        }
+        .spinner {
+            display: inline-block;
+            width: 1.1rem;
+            height: 1.1rem;
+            border: 2.5px solid rgba(255, 255, 255, 0.3);
+            border-top-color: #ffffff;
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .hidden {
+            display: none !important;
+        }
+        .file-hint {
+            font-size: 0.8rem;
+            color: #94a3b8;
+            margin-top: 0.25rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>DOCX Merger <span>local</span></h1>
+        <p class="subtitle">
+            Combine two Word documents into one. The second document is appended
+            directly below the first. All processing happens in your browser.
+        </p>
+
+        <!-- File 1 -->
+        <div class="file-group">
+            <label for="file1">First document <small>(top)</small></label>
+            <input type="file" id="file1" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document">
+        </div>
+
+        <!-- File 2 -->
+        <div class="file-group">
+            <label for="file2">Second document <small>(bottom)</small></label>
+            <input type="file" id="file2" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document">
+        </div>
+
+        <!-- Merge button -->
+        <button id="mergeBtn" disabled>
+            <span id="btnIcon">🔗</span>
+            <span id="btnText">Merge documents</span>
+        </button>
+
+        <!-- Status message -->
+        <div id="status" class="status"></div>
+
+        <!-- Download link (hidden until ready) -->
+        <div id="downloadWrap" class="download-link">
+            <a id="downloadLink" href="#" download="merged.docx">
+                ⬇ Download merged DOCX
+            </a>
+        </div>
+    </div>
+
+    <!-- Browser global build of the DOCX merger library -->
+    <script src="https://unpkg.com/@jonathanhotono/browser-docx-merger/dist/index.global.js"></script>
+
+    <script>
+        (function () {
+            'use strict';
+
+            // --- DOM references ---
+            const fileInput1 = document.getElementById('file1');
+            const fileInput2 = document.getElementById('file2');
+            const mergeBtn = document.getElementById('mergeBtn');
+            const btnIcon = document.getElementById('btnIcon');
+            const btnText = document.getElementById('btnText');
+            const statusEl = document.getElementById('status');
+            const downloadWrap = document.getElementById('downloadWrap');
+            const downloadLink = document.getElementById('downloadLink');
+
+            // --- State ---
+            let file1 = null;
+            let file2 = null;
+            let isMerging = false;
+            let currentObjectUrl = null;
+
+            // --- Helpers ---
+            function setStatus(message, type) {
+                statusEl.textContent = message;
+                statusEl.className = 'status' + (type ? ' ' + type : '');
+            }
+
+            function clearStatus() {
+                statusEl.textContent = '';
+                statusEl.className = 'status';
+                statusEl.style.display = 'none';
+            }
+
+            function revokeObjectUrl() {
+                if (currentObjectUrl) {
+                    URL.revokeObjectURL(currentObjectUrl);
+                    currentObjectUrl = null;
+                }
+            }
+
+            function updateButtonState() {
+                const bothSelected = file1 && file2;
+                mergeBtn.disabled = !bothSelected || isMerging;
+
+                if (isMerging) {
+                    btnIcon.innerHTML = '<span class="spinner"></span>';
+                    btnText.textContent = 'Merging…';
+                } else {
+                    btnIcon.textContent = '🔗';
+                    btnText.textContent = 'Merge documents';
+                }
+            }
+
+            function resetDownload() {
+                revokeObjectUrl();
+                downloadWrap.style.display = 'none';
+                downloadLink.href = '#';
+            }
+
+            // --- File input handlers ---
+            fileInput1.addEventListener('change', function () {
+                file1 = this.files[0] || null;
+                resetDownload();
+                clearStatus();
+                if (file1) {
+                    setStatus('First document selected: ' + file1.name, 'info');
+                }
+                updateButtonState();
+            });
+
+            fileInput2.addEventListener('change', function () {
+                file2 = this.files[0] || null;
+                resetDownload();
+                clearStatus();
+                if (file2) {
+                    setStatus('Second document selected: ' + file2.name, 'info');
+                }
+                updateButtonState();
+            });
+
+            // --- Merge logic ---
+            mergeBtn.addEventListener('click', async function () {
+                if (!file1 || !file2 || isMerging) return;
+
+                // Reset previous result
+                resetDownload();
+                clearStatus();
+
+                isMerging = true;
+                updateButtonState();
+
+                try {
+                    // The library accepts File objects directly and returns a Blob.
+                    // With `insertEnd: true`, the second document is appended
+                    // at the end of the first (i.e., one below the other).
+                    const mergedBlob = await DocxMerger.mergeDocxFromFiles(
+                        [file1, file2],
+                        {
+                            insertEnd: true,        // append second doc after first
+                            mergeStyles: true,       // keep original formatting
+                            mergeNumbering: true,    // keep lists / numbering
+                            mergeFootnotes: true,    // carry over footnotes
+                            pageBreaks: false        // no extra blank page between docs
+                        }
+                    );
+
+                    // Create a download link for the merged Blob
+                    currentObjectUrl = URL.createObjectURL(mergedBlob);
+                    downloadLink.href = currentObjectUrl;
+                    downloadLink.download = 'merged.docx';
+                    downloadWrap.style.display = 'block';
+
+                    setStatus(
+                        '✅ Documents merged successfully. Click the download link below.',
+                        'success'
+                    );
+                } catch (error) {
+                    console.error('Merge failed:', error);
+                    setStatus(
+                        '❌ Merge failed: ' + (error.message || 'Unknown error. Please try again with different files.'),
+                        'error'
+                    );
+                } finally {
+                    isMerging = false;
+                    updateButtonState();
+                }
+            });
+
+            // --- Cleanup on page unload ---
+            window.addEventListener('beforeunload', function () {
+                revokeObjectUrl();
+            });
+        })();
+    </script>
+</body>
+</html>

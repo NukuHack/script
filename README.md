@@ -39,6 +39,7 @@ Python basics.
 | Project | Description |
 |---|---|
 | `shapez2-visualizer` | A basic shape visualizer. *(for a game)* |
+| `docx_merger` | Merge 2 docx files, just append |
 
 ---
 

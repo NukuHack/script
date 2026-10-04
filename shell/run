@@ -6,9 +6,11 @@ if [ $# -lt 1 ]; then
 Usage: run.sh INPUT [FUNCTION]
 
   INPUT     C source file to compile.
-  FUNCTION  Optional. If given, the file's own main (if any) is renamed
-            out of the way and a tiny driver calls FUNCTION() instead.
-            Works for both 'void FUNCTION(void)' and 'int FUNCTION(void)'.
+  FUNCTION  Optional. If given and different from "main", the file's own
+            main (if any) is renamed out of the way and a tiny driver
+            calls FUNCTION() instead.
+            If FUNCTION is "main" (or omitted), the file is compiled
+            normally and its own main runs.
 
 Binary is built in a temp dir and removed when this script exits.
 USAGE
@@ -23,24 +25,23 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 BIN="$TMPDIR/a.out"
 
-if [ -n "$FUNCTION" ]; then
+if [ -n "$FUNCTION" ] && [ "$FUNCTION" != "main" ]; then
     echo "Compiling $INPUT (entry: $FUNCTION) -> temp binary"
 
     cat > "$TMPDIR/driver.c" <<EOF
 /* auto-generated driver: calls $FUNCTION() as the entry point */
-extern void $FUNCTION(void);
+extern int $FUNCTION(void);
 
 int main(void) {
-    $FUNCTION();
-    return 0;
+    return $FUNCTION();
 }
 EOF
 
-    gcc -c "$INPUT"            -o "$TMPDIR/input.o"  \
+    gcc -c "$INPUT" -o "$TMPDIR/input.o" \
         -Dmain=__unused_main__ \
         -W -Wall -Wextra -pedantic
 
-    gcc -c "$TMPDIR/driver.c"  -o "$TMPDIR/driver.o" \
+    gcc -c "$TMPDIR/driver.c" -o "$TMPDIR/driver.o" \
         -W -Wall -Wextra -pedantic
 
     gcc "$TMPDIR/input.o" "$TMPDIR/driver.o" -o "$BIN"

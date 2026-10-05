@@ -1,33 +1,103 @@
 #!/bin/bash
 set -e
 
-if [ $# -lt 1 ]; then
+usage() {
     cat >&2 <<'USAGE'
-Usage: run.sh INPUT [FUNCTION]
+Usage: run.sh [-main FUNCTION] INPUT...
 
-  INPUT     C source file to compile.
-  FUNCTION  Optional. If given and different from "main", the file's own
-            main (if any) is renamed out of the way and a tiny driver
-            calls FUNCTION() instead.
-            If FUNCTION is "main" (or omitted), the file is compiled
-            normally and its own main runs.
+  INPUT     One or more C source files. Each one is compiled individually
+            into its own object file, then all the objects are linked
+            together into a single program which is run.
+
+  -main FUNCTION
+            Optional. If given (and not literally "main"), the main()
+            of every input file is renamed out of the way and a tiny
+            driver calls FUNCTION() instead. FUNCTION is expected to be
+            the one defined in the first input file.
 
 Binary is built in a temp dir and removed when this script exits.
 USAGE
+}
+
+FUNCTION=""
+INPUTS=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -main)
+            if [ $# -lt 2 ]; then
+                echo "run.sh: -main requires a function name" >&2
+                exit 1
+            fi
+            FUNCTION="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            while [ $# -gt 0 ]; do
+                INPUTS+=("$1")
+                shift
+            done
+            ;;
+        -*)
+            echo "run.sh: unknown option: $1" >&2
+            usage
+            exit 1
+            ;;
+        *)
+            INPUTS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [ "${#INPUTS[@]}" -eq 0 ]; then
+    usage
     exit 1
 fi
-
-INPUT="$1"
-FUNCTION="$2"
 
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
 BIN="$TMPDIR/a.out"
+OBJECTS=()
 
+USE_DRIVER=0
 if [ -n "$FUNCTION" ] && [ "$FUNCTION" != "main" ]; then
-    echo "Compiling $INPUT (entry: $FUNCTION) -> temp binary"
+    USE_DRIVER=1
+fi
 
+if [ "$USE_DRIVER" -eq 1 ]; then
+    echo "Compiling ${#INPUTS[@]} file(s) (entry: $FUNCTION) -> temp binary"
+else
+    echo "Compiling ${#INPUTS[@]} file(s) -> temp binary"
+fi
+
+i=0
+for src in "${INPUTS[@]}"; do
+    obj="$TMPDIR/input$i.o"
+    OBJECTS+=("$obj")
+
+    if [ "$USE_DRIVER" -eq 1 ]; then
+        # Rename this file's own main() out of the way. The name is made
+        # unique per file so several files can each have a main() without
+        # clashing at link time.
+        gcc -c "$src" -o "$obj" \
+            -Dmain="__unused_main_${i}__" \
+            -W -Wall -Wextra -pedantic
+    else
+        gcc -c "$src" -o "$obj" \
+            -W -Wall -Wextra -pedantic
+    fi
+
+    i=$((i + 1))
+done
+
+if [ "$USE_DRIVER" -eq 1 ]; then
     cat > "$TMPDIR/driver.c" <<EOF
 /* auto-generated driver: calls $FUNCTION() as the entry point */
 extern int $FUNCTION(void);
@@ -37,17 +107,12 @@ int main(void) {
 }
 EOF
 
-    gcc -c "$INPUT" -o "$TMPDIR/input.o" \
-        -Dmain=__unused_main__ \
-        -W -Wall -Wextra -pedantic
-
     gcc -c "$TMPDIR/driver.c" -o "$TMPDIR/driver.o" \
         -W -Wall -Wextra -pedantic
 
-    gcc "$TMPDIR/input.o" "$TMPDIR/driver.o" -o "$BIN"
-else
-    echo "Compiling $INPUT -> temp binary"
-    gcc "$INPUT" -o "$BIN" -W -Wall -Wextra -pedantic
+    OBJECTS+=("$TMPDIR/driver.o")
 fi
+
+gcc "${OBJECTS[@]}" -o "$BIN"
 
 "$BIN"

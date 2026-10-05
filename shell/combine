@@ -1,13 +1,15 @@
 #!/bin/sh
 #
-# combine.sh - Combine files with a filterable expression.
+# combine - Combine files with a filterable expression. (POSIX sh version)
 #
-# Usage: combine.sh <folder> [options] [filter...]
+# Usage: combine <folder> [options] [filter...]
+#
+# Limitation: file names containing newlines are not supported.
 #
 
 usage() {
     cat <<'EOF'
-Usage: combine.sh <folder> [options] [filter...]
+Usage: combine <folder> [options] [filter...]
 
 Options:
   -o, --output FILE   Output file (default: combined.txt)
@@ -20,20 +22,52 @@ Filter expression:
 Operators:  and  &  &&  |  or  ||  !  not  ( )
 
 Examples:
-  combine.sh ./src '*.rs'
-  combine.sh ./src '*.rs' or '*.toml'
-  combine.sh ./src '*.rs' and not '*test*'
-  combine.sh ./src --git and not '*.txt'
-  combine.sh ./src '(' '*.rs' or '*.toml' ')' and not '*build*'
-  combine.sh ./src "--git & !*.txt"
+  combine ./src '*.rs'
+  combine ./src '*.rs' or '*.toml'
+  combine ./src '*.rs' and not '*test*'
+  combine ./src --git and not '*.txt'
+  combine ./src '(' '*.rs' or '*.toml' ')' and not '*build*'
+  combine ./src "--git & !*.txt"
 EOF
 }
 
+# Never let the shell expand our glob patterns against the filesystem.
+set -f
+
 if [ $# -eq 0 ]; then usage; exit 1; fi
 
+# ---------- Token storage (POSIX sh has no arrays) ----------
+# Tokens live in variables TOK_1, TOK_2, ... ; NTOK is the count.
+NTOK=0
+GIT_ONLY=0
+
+add_tok() {
+    NTOK=$((NTOK + 1))
+    eval "TOK_$NTOK=\$1"
+}
+
+# Split one argument on whitespace and operators, normalise the operators
+# to the canonical keywords: and / or / not / ( / )
+tokenize_arg() {
+    [ -z "$1" ] && return 0
+    _s=$(printf '%s\n' "$1" | sed \
+        -e 's/&&/ and /g' \
+        -e 's/||/ or /g' \
+        -e 's/\([()&|!]\)/ \1 /g')
+    for _tok in $_s; do
+        case "$_tok" in
+            and|AND|\&)  add_tok "and" ;;
+            or|OR|\|)    add_tok "or" ;;
+            not|NOT|\!)  add_tok "not" ;;
+            --git|-g)    GIT_ONLY=1; add_tok "$_tok" ;;
+            *)           add_tok "$_tok" ;;
+        esac
+    done
+}
+
+# ---------- Parse command line ----------
 FOLDER=""
 OUTPUT="combined.txt"
-FILTER_ARGS=()
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -43,7 +77,7 @@ while [ $# -gt 0 ]; do
             OUTPUT="$2"; shift 2 ;;
         *)
             if [ -z "$FOLDER" ]; then FOLDER="$1"
-            else FILTER_ARGS+=("$1"); fi
+            else tokenize_arg "$1"; fi
             shift ;;
     esac
 done
@@ -56,30 +90,6 @@ case "$OUTPUT" in
     *) OUTPUT="$(pwd)/$OUTPUT" ;;
 esac
 
-# ---------- Tokenize filter expression ----------
-# Each arg is split on whitespace and on operators, then normalised to
-# the canonical keywords: and / or / not / ( / )
-TOKENS=()
-for arg in ${FILTER_ARGS[@]+"${FILTER_ARGS[@]}"}; do
-    [ -z "$arg" ] && continue
-    s="${arg//&&/ and }"
-    s="${s//||/ or }"
-    s=$(printf '%s' "$s" | sed -E 's/([()&|!])/ \1 /g')
-    for tok in $s; do
-        case "$tok" in
-            and|AND|\&)  TOKENS+=("and") ;;
-            or|OR|\|)    TOKENS+=("or") ;;
-            not|NOT|\!)  TOKENS+=("not") ;;
-            *)           TOKENS+=("$tok") ;;
-        esac
-    done
-done
-
-GIT_ONLY=0
-for t in ${TOKENS[@]+"${TOKENS[@]}"}; do
-    case "$t" in --git|-g) GIT_ONLY=1 ;; esac
-done
-
 # ---------- Expression parser / evaluator ----------
 # Grammar (with implicit-AND between adjacent primaries):
 #   or_expr  := and_expr ('or' and_expr)*
@@ -87,86 +97,104 @@ done
 #   not_expr := 'not' not_expr | primary
 #   primary  := '(' or_expr ')' | FILTER
 # FILTER is a glob pattern matched against the relative file path,
-# or the special token '--git' / '-g' which always matches (file list
-# has already been restricted to git-tracked files when it's present).
+# or '--git' / '-g' which always matches (the file list has already been
+# restricted to git-tracked files when it is present).
+#
+# Every function returns 0 (true) or 1 (false).  Without 'local' variables,
+# intermediate results are passed along as function arguments instead, so
+# recursion can't clobber them.
 
-POS=0
+POS=1
+TOK=""
 CURRENT_FILE=""
+
+# Load the token at position POS into TOK (empty past the end).
+peek() {
+    eval "TOK=\${TOK_$POS:-}"
+}
 
 eval_or() {
     eval_and
-    local result=$?
-    local r
-    while [ "${TOKENS[$POS]:-}" = "or" ]; do
-        POS=$((POS+1))
-        eval_and; r=$?
-        [ $r -eq 0 ] && result=0
-    done
-    return $result
+    eval_or_rest $?
+}
+
+eval_or_rest() {            # $1 = result so far
+    peek
+    if [ "$TOK" = "or" ]; then
+        POS=$((POS + 1))
+        eval_and
+        eval_or_rest $(( $1 && $? ))     # 0 if either side is 0
+    else
+        return "$1"
+    fi
 }
 
 eval_and() {
     eval_not
-    local result=$?
-    local r tok
-    while :; do
-        tok="${TOKENS[$POS]:-}"
-        if [ "$tok" = "and" ]; then
-            POS=$((POS+1))
-            eval_not; r=$?
-            [ $r -ne 0 ] && result=1
-        elif [ -z "$tok" ] || [ "$tok" = "or" ] || [ "$tok" = ")" ]; then
-            break
-        else
-            # implicit AND between adjacent primaries
-            eval_not; r=$?
-            [ $r -ne 0 ] && result=1
-        fi
-    done
-    return $result
+    eval_and_rest $?
+}
+
+eval_and_rest() {           # $1 = result so far
+    peek
+    case "$TOK" in
+        ""|or|")") return "$1" ;;
+        and)       POS=$((POS + 1)) ;;
+    esac                                  # anything else: implicit AND
+    eval_not
+    eval_and_rest $(( $1 || $? ))        # 0 only if both sides are 0
 }
 
 eval_not() {
-    if [ "${TOKENS[$POS]:-}" = "not" ]; then
-        POS=$((POS+1))
+    peek
+    if [ "$TOK" = "not" ]; then
+        POS=$((POS + 1))
         eval_not
-        local r=$?
-        if [ $r -eq 0 ]; then return 1; else return 0; fi
+        if [ $? -eq 0 ]; then return 1; else return 0; fi
     fi
     eval_primary
 }
 
-eval_primary() {
-    local tok="${TOKENS[$POS]:-}"
-    if [ "$tok" = "(" ]; then
-        POS=$((POS+1))
-        eval_or
-        local r=$?
-        if [ "${TOKENS[$POS]:-}" != ")" ]; then
-            echo "Error: expected ')' in filter expression" >&2
-            exit 1
-        fi
-        POS=$((POS+1))
-        return $r
+eval_close_paren() {        # $1 = result of the inner expression
+    peek
+    if [ "$TOK" != ")" ]; then
+        echo "Error: expected ')' in filter expression" >&2
+        exit 1
     fi
-    if [ -z "$tok" ]; then
+    POS=$((POS + 1))
+    return "$1"
+}
+
+eval_primary() {
+    peek
+    if [ "$TOK" = "(" ]; then
+        POS=$((POS + 1))
+        eval_or
+        eval_close_paren $?
+        return $?
+    fi
+    if [ -z "$TOK" ]; then
         echo "Error: unexpected end of filter expression" >&2
         exit 1
     fi
-    POS=$((POS+1))
-    case "$tok" in
-        --git|-g) return 0 ;;   # source already filtered to git files
+    POS=$((POS + 1))
+    case "$TOK" in
+        --git|-g) return 0 ;;     # source already filtered to git files
     esac
-    [[ "$CURRENT_FILE" == $tok ]]
+    # $TOK is deliberately unquoted so it acts as a glob pattern.
+    case "$CURRENT_FILE" in
+        $TOK) return 0 ;;
+        *)    return 1 ;;
+    esac
 }
 
 # Validate expression once, before touching any files.
-if [ ${#TOKENS[@]} -gt 0 ]; then
+if [ "$NTOK" -gt 0 ]; then
     CURRENT_FILE="__validate__"
-    POS=0
+    POS=1
     eval_or
-    if [ "$POS" -ne "${#TOKENS[@]}" ]; then
-        echo "Error: unexpected token '${TOKENS[$POS]}' in filter expression" >&2
+    if [ "$POS" -ne $((NTOK + 1)) ]; then
+        peek
+        printf "Error: unexpected token '%s' in filter expression\n" "$TOK" >&2
         exit 1
     fi
 fi
@@ -175,45 +203,44 @@ fi
 cd "$FOLDER" || exit 1
 FOLDER_ABS="$(pwd)"
 
-FILES=()
+LIST="${TMPDIR:-/tmp}/combine.$$"
+trap 'rm -f "$LIST"' EXIT HUP INT TERM
+
 if [ "$GIT_ONLY" = "1" ]; then
     if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         echo "Error: $FOLDER is not a git repository (required by --git)" >&2
         exit 1
     fi
-    while IFS= read -r f; do
-        [ -n "$f" ] && FILES+=("$f")
-    done < <(git ls-files)
+    git ls-files > "$LIST"
 else
-    while IFS= read -r -d '' f; do
-        FILES+=("${f#./}")
-    done < <(find . -type f -print0)
+    find . -type f | sed 's|^\./||' > "$LIST"
 fi
 
 # ---------- Combine ----------
-> "$OUTPUT"
+: > "$OUTPUT"
 COUNT=0
-for CURRENT_FILE in "${FILES[@]}"; do
+while IFS= read -r CURRENT_FILE; do
+    [ -n "$CURRENT_FILE" ] || continue
     [ -f "$CURRENT_FILE" ] || continue
     # Don't eat our own output if it lives inside the folder.
     [ "$FOLDER_ABS/$CURRENT_FILE" = "$OUTPUT" ] && continue
 
     include=0
-    if [ ${#TOKENS[@]} -eq 0 ]; then
+    if [ "$NTOK" -eq 0 ]; then
         include=1
     else
-        POS=0
+        POS=1
         if eval_or; then include=1; fi
     fi
 
-    if [ $include -eq 1 ]; then
+    if [ "$include" -eq 1 ]; then
         {
-            echo "=== $CURRENT_FILE ==="
+            printf '=== %s ===\n' "$CURRENT_FILE"
             cat "$CURRENT_FILE"
-            echo ""
+            printf '\n'
         } >> "$OUTPUT"
-        COUNT=$((COUNT+1))
+        COUNT=$((COUNT + 1))
     fi
-done
+done < "$LIST"
 
 echo "Combined $COUNT file(s) into $OUTPUT"

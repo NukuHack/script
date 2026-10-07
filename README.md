@@ -29,6 +29,7 @@ Python basics.
 | `bitburner` | Using the Bitburner API to manage in-game and real files. *(for a game)* |
 | `build_any` | *(test)* A general builder for repos and such. |
 | `keyboard_to_mouse` | Simulate mouse from keyboard. *(kinda broken)* |
+| `merge_c` | A small script to merge c (or cpp) files together `i hate headers` |
 
 ---
 

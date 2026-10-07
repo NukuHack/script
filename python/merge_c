@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
 merge_c.py -- merge multiple C/C++ sources+headers into a single file.
 
@@ -36,10 +36,13 @@ Usage
     merge_c.py -o out.c a.c -I include --line
 """
 
+from __future__ import print_function
+
 import sys
 import os
 import re
 import argparse
+import io
 
 # ------------------------------------------------------------------ constants
 
@@ -316,8 +319,12 @@ def resolve(cur_path, name, kind, ctx):
 
 
 def read_text(path):
-    with open(path, 'r', encoding='utf-8', errors='surrogateescape') as f:
-        return f.read()
+    with io.open(path, 'rb') as f:
+        data = f.read()
+    try:
+        return data.decode('utf-8', 'surrogateescape')
+    except (LookupError, TypeError):
+        return data.decode('utf-8', 'replace')
 
 
 def load_unit(path, ctx, mark=True):
@@ -329,7 +336,7 @@ def load_unit(path, ctx, mark=True):
     try:
         text = read_text(path)
     except OSError as e:
-        ctx.warn(f"cannot read {path}: {e}")
+        ctx.warn("cannot read {}: {}".format(path, e))
         return None
 
     unit = Unit(path)
@@ -420,8 +427,7 @@ def load_unit(path, ctx, mark=True):
                             ctx.sys_includes.append(inc)
                         emit = blank
                 else:
-                    ctx.warn(f'cannot find include "{inc}" (from {path}); '
-                             f'left as is')
+                    ctx.warn('cannot find include "{}" (from {}); left as is'.format(inc, path))
         elif name == 'define' and PRELUDE_RE.match(mjoined) \
                 and not any(not f.fold for f in stack):
             line = ojoined.strip()
@@ -495,17 +501,17 @@ def rename_statics(units, rename_all):
         n = used_prefix.get(pre, 0)
         used_prefix[pre] = n + 1
         if n:
-            pre = f"{pre}{n}"
+            pre = "%s%d" % (pre, n)
         ren = {}
         for f in funcs:
             nm = f['name']
             if f['static'] and nm not in NEVER_RENAME and \
                     (rename_all or defs[nm] - {id(u)}):
-                ren[nm] = f"{pre}_{nm}"
+                ren[nm] = "{}_{}".format(pre, nm)
         if ren:
             u.text = apply_rename(u.text, cs, ren, members)
-            print(f"  renamed in {u.path}: "
-                  + ", ".join(f"{k}->{v}" for k, v in ren.items()),
+            print("  renamed in {}: ".format(u.path)
+                  + ", ".join("{}->{}".format(k, v) for k, v in ren.items()),
                   file=sys.stderr)
 
 
@@ -518,16 +524,16 @@ def esc(p):
 def render(unit, use_line):
     def repl(mo):
         child, lineno = unit.incs[int(mo.group(1))]
-        s = f"/* ===== begin: {child.path} ===== */\n"
+        s = "/* ===== begin: {} ===== */\n".format(child.path)
         if use_line:
-            s += f'#line 1 "{esc(child.path)}"\n'
+            s += '#line 1 "{}"\n'.format(esc(child.path))
         s += render(child, use_line)
-        s += f"\n/* ===== end: {child.path} ===== */"
+        s += "\n/* ===== end: {} ===== */".format(child.path)
         if use_line:
-            s += f'\n#line {lineno + 1} "{esc(unit.path)}"'
+            s += '\n#line {} "{}"'.format(lineno + 1, esc(unit.path))
         return s
     text = re.sub('\x02(\\d+)\x02',
-                  lambda mo: f'#line {mo.group(1)} "{esc(unit.path)}"',
+                  lambda mo: '#line {} "{}"'.format(mo.group(1), esc(unit.path)),
                   unit.text)
     return re.sub('\x01INC(\\d+)\x01', repl, text).strip('\n')
 
@@ -694,7 +700,7 @@ def init_is_literal(m, start):
     if '?' in init:
         init = init.split('?', 1)[1]      # condition may be anything
     init = re.sub(r'\bNULL\b|\b0\b', '', init)
-    return re.fullmatch(r'[\s"?:(){},]*', init) is not None
+    return re.match(r'\A[\s"?:(){},]*\Z', init) is not None
 
 
 def constify(text):
@@ -741,7 +747,7 @@ def constify(text):
                 if any(pp.match(m[x:y]) for pp in CHAR_PARAMS):
                     edits.append(x + re.search(r'\bchar\b', m[x:y]).start())
             cands[('p', name, j)] = Cand(pm.group('n'), 1, f['body'], edits)
-            labels[('p', name, j)] = f"parameter '{pm.group('n')}' of {name}()"
+            labels[('p', name, j)] = "parameter '{0}' of {1}()".format(pm.group('n'), name)
 
     # ---- variables initialised with string literals
     for mo in DECL_LIT.finditer(m):
@@ -756,7 +762,7 @@ def constify(text):
                      if f['body'][0] < cpos < f['body'][1]), None)
         if body:
             cands[('v', cpos)] = Cand(name, P, body, [cpos], [mo.start(2)])
-            labels[('v', cpos)] = f"local '{name}'"
+            labels[('v', cpos)] = "local '{}'".format(name)
         else:
             edits, skip = [cpos], [mo.start(2)]
             for d in re.finditer(r'(?<![\w*])(char)\s*\*\s*([A-Za-z_]\w*)\s*'
@@ -766,7 +772,7 @@ def constify(text):
                     edits.append(d.start(1))
                     skip.append(d.start(2))
             cands[('v', cpos)] = Cand(name, P, (0, len(m)), edits, skip, True)
-            labels[('v', cpos)] = f"global '{name}'"
+            labels[('v', cpos)] = "global '{}'".format(name)
 
     failed = set()
 
@@ -847,9 +853,9 @@ def main():
     out_real = os.path.realpath(args.output)
     for f in args.files:
         if not os.path.isfile(f):
-            sys.exit(f"error: {f}: no such file")
+            sys.exit("error: {}: no such file".format(f))
         if os.path.realpath(f) == out_real:
-            sys.exit(f"error: output {args.output} is also an input")
+            sys.exit("error: output {} is also an input".format(args.output))
 
     ctx = Ctx(args)
     roots = [u for u in (load_unit(f, ctx) for f in args.files) if u]
@@ -864,11 +870,11 @@ def main():
 
     body = []
     for u in roots:
-        body.append(f"/* ===== begin: {u.path} ===== */")
+        body.append("/* ===== begin: {} ===== */".format(u.path))
         if args.line:
-            body.append(f'#line 1 "{esc(u.path)}"')
+            body.append('#line 1 "{}"'.format(esc(u.path)))
         body.append(render(u, args.line))
-        body.append(f"/* ===== end: {u.path} ===== */")
+        body.append("/* ===== end: {} ===== */".format(u.path))
         body.append("")
     body_text = "\n".join(body)
 
@@ -876,32 +882,35 @@ def main():
         args.const_strings == 'auto' and target == 'cpp' and not src_cpp)
     if do_const:
         body_text, changed, skipped = constify(body_text)
-        print(f"  const char*: {len(changed)} converted, "
-              f"{len(skipped)} left unchanged", file=sys.stderr)
+        print("  const char*: {} converted, {} left unchanged".format(len(changed), len(skipped)), file=sys.stderr)
         for c in changed:
-            print(f"    + {c}", file=sys.stderr)
+            print("    + {}".format(c), file=sys.stderr)
         for c in skipped:
-            print(f"    - {c} (not provably read-only)", file=sys.stderr)
+            print("    - {} (not provably read-only)".format(c), file=sys.stderr)
 
-    head = [f"/* generated by merge_c.py ({target}) */", ""]
+    head = ["/* generated by merge_c.py ({}) */".format(target), ""]
     if ctx.prelude:
         for line in ctx.prelude:
             dm = re.match(r'\s*#\s*define\s+(\w+)\s*$', line)
-            head += ([f"#ifndef {dm.group(1)}", line, "#endif"]
+            head += (["#ifndef {}".format(dm.group(1)), line, "#endif"]
                      if dm else [line])
         head.append("")
     if ctx.sys_includes:
-        head += [f"#include <{i}>" for i in ctx.sys_includes] + [""]
+        head += ["#include <{}>".format(i) for i in ctx.sys_includes] + [""]
 
     if args.dry_run:
         print("dry run: nothing written", file=sys.stderr)
     else:
-        with open(args.output, 'w', encoding='utf-8',
-                  errors='surrogateescape', newline='\n') as f:
-            f.write("\n".join(head) + "\n" + body_text)
+        content = "\n".join(head) + "\n" + body_text
+        try:
+            out_bytes = content.encode('utf-8', 'surrogateescape')
+        except (LookupError, TypeError):
+            out_bytes = content.encode('utf-8', 'replace')
+        with io.open(args.output, 'wb') as f:
+            f.write(out_bytes)
             if not body_text.endswith('\n'):
-                f.write('\n')
-        print(f"wrote {args.output}", file=sys.stderr)
+                f.write(b'\n')
+        print("wrote {}".format(args.output), file=sys.stderr)
 
     if args.strict and ctx.warnings:
         sys.exit(1)

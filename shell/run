@@ -3,7 +3,7 @@ set -e
 
 usage() {
     cat >&2 <<'USAGE'
-Usage: run.sh [-main FUNCTION] INPUT...
+Usage: run.sh [-main FUNCTION] [-Xcc FLAG]... INPUT...
 
   INPUT     One or more C source files. Each one is compiled individually
             into its own object file, then all the objects are linked
@@ -15,12 +15,16 @@ Usage: run.sh [-main FUNCTION] INPUT...
             driver calls FUNCTION() instead. FUNCTION is expected to be
             the one defined in the first input file.
 
+  -Xcc FLAG Pass FLAG to the compiler and linker (e.g. -Xcc -O3
+            -Xcc -march=native -Xcc -ffast-math). May be repeated.
+
 Binary is built in a temp dir and removed when this script exits.
 USAGE
 }
 
 FUNCTION=""
 INPUTS=()
+CFLAGS_EXTRA=()
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -30,6 +34,14 @@ while [ $# -gt 0 ]; do
                 exit 1
             fi
             FUNCTION="$2"
+            shift 2
+            ;;
+        -Xcc)
+            if [ $# -lt 2 ]; then
+                echo "run.sh: -Xcc requires an argument" >&2
+                exit 1
+            fi
+            CFLAGS_EXTRA+=("$2")
             shift 2
             ;;
         -h|--help)
@@ -88,10 +100,12 @@ for src in "${INPUTS[@]}"; do
         # clashing at link time.
         gcc -c "$src" -o "$obj" \
             -Dmain="__unused_main_${i}__" \
-            -W -Wall -Wextra -pedantic
+            -W -Wall -Wextra -pedantic \
+            "${CFLAGS_EXTRA[@]}"
     else
         gcc -c "$src" -o "$obj" \
-            -W -Wall -Wextra -pedantic
+            -W -Wall -Wextra -pedantic \
+            "${CFLAGS_EXTRA[@]}"
     fi
 
     i=$((i + 1))
@@ -108,11 +122,13 @@ int main(void) {
 EOF
 
     gcc -c "$TMPDIR/driver.c" -o "$TMPDIR/driver.o" \
-        -W -Wall -Wextra -pedantic
+        -W -Wall -Wextra -pedantic \
+        "${CFLAGS_EXTRA[@]}"
 
     OBJECTS+=("$TMPDIR/driver.o")
 fi
 
-gcc "${OBJECTS[@]}" -o "$BIN"
+# -lm at link time so math functions (sqrtf, expf, logf, ...) resolve.
+gcc "${OBJECTS[@]}" -o "$BIN" "${CFLAGS_EXTRA[@]}" -lm
 
 "$BIN"

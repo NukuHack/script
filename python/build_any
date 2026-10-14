@@ -1,6 +1,12 @@
 #!/usr/bin/env python
 from __future__ import print_function
 
+try:
+    from shlex import quote as cmd_quote
+except ImportError:
+    from pipes import quote as cmd_quote
+
+
 import argparse
 import os
 import platform
@@ -43,9 +49,9 @@ def run(cmd, cwd=None, check=True, capture=False):
     if isinstance(cmd, str):
         cmd = shlex.split(cmd)
     if cwd:
-        info('$ ' + ' '.join(shlex.quote(c) for c in cmd) + '   (cwd=' + str(cwd) + ')')
+        info('$ ' + ' '.join(cmd_quote(c) for c in cmd) + '   (cwd=' + str(cwd) + ')')
     else:
-        info('$ ' + ' '.join(shlex.quote(c) for c in cmd))
+        info('$ ' + ' '.join(cmd_quote(c) for c in cmd))
     if capture:
         proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         out, _ = proc.communicate()

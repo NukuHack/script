@@ -263,15 +263,19 @@ mac_btn_idx()  { case $BTN in left) M_IDX=0; M_DN=1;  M_UP=2;;  right) M_IDX=1; 
 
 # -------------------------------------------------- Caps Lock state reader ---
 # Sets CAPS to 1 (on) or 0 (off).
+caps_led_scan() {
+    CAPS_LEDS=
+    for f in /sys/class/leds/*capslock/brightness; do
+        [ -r "$f" ] && CAPS_LEDS="$CAPS_LEDS $f"
+    done
+}
+
 caps_setup() {
     case $BACKEND in
         macos)   CAPS_SRC=mac;  [ "$TICK" = 0.05 ] && TICK=0.1 ;;
         windows) CAPS_SRC=win ;;
         *)
-            CAPS_LEDS=
-            for f in /sys/class/leds/*capslock/brightness; do
-                [ -r "$f" ] && CAPS_LEDS="$CAPS_LEDS $f"
-            done
+            caps_led_scan
             if [ -n "$CAPS_LEDS" ]; then
                 CAPS_SRC=led                           # cheap: no process spawn
             elif have xset; then
@@ -286,10 +290,22 @@ caps_poll() {
     case $CAPS_SRC in
         led)
             CAPS=0
+            stale=0
             for f in $CAPS_LEDS; do
-                v=0; read -r v <"$f" 2>/dev/null
+                if [ ! -r "$f" ]; then stale=1; continue; fi
+                v=0
+                read -r v 2>/dev/null <"$f" || :
                 [ "${v:-0}" != 0 ] && CAPS=1
-            done ;;
+            done
+            if [ "$stale" = 1 ]; then
+                caps_led_scan
+                CAPS=0
+                for f in $CAPS_LEDS; do
+                    v=0
+                    read -r v 2>/dev/null <"$f" || :
+                    [ "${v:-0}" != 0 ] && CAPS=1
+                done
+            fi ;;
         xset)
             if xset q 2>/dev/null | grep -q 'Caps Lock: *on'; then CAPS=1; else CAPS=0; fi ;;
         mac)

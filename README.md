@@ -55,4 +55,10 @@ Python basics.
 | `build` | A basic rust run script |
 | `cleanup` | A small script for cleaning out old files|
 
+---
+
+# term-profile
+
+- just the stuff i surce my terminal with
+
 

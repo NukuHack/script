@@ -1,98 +1,104 @@
 #!/bin/sh
-# Local fork of the upstream build script from NukuHack/script.
-#
-# Keep the same CLI contract as the original script (`-y`, `-c`, `-n`, `-q`, `-r`,
-# `--web`). CI runs the full suite every time, same as a local run: native
-# tests, the wasm-pack browser suite, and Miri all run on `--web` builds too,
-# with no CI-mode shortcuts.
-#
-# Compatibility note: this script is written in plain POSIX sh (no bashisms,
-# no `pipefail`, no arrays, no `local`) and is tested under dash, sh and bash.
-# The only place the original relied on a pipeline (`find | while read`) has
-# been rewritten to go through a temp file instead, so a failing `find` still
-# aborts the script under `set -e` even without `pipefail`. When run under
-# bash we still turn `pipefail` on as a harmless extra safety net.
-
 set -eu
-if [ -n "${BASH_VERSION:-}" ]; then
-	set -o pipefail
-fi
+[ -n "${BASH_VERSION:-}" ] && set -o pipefail
 
 MAX_LINE_WIDTH=150
 MAX_FILE_LINES=500
+MAX_FIX_ITER=5
 RUSTFMT_TOML="rustfmt.toml"
+CLIPPY_MSG="clippy-autofix: apply machine-applicable suggestions"
 
-RUN_ALL=false
-SKIP_ALL=false
-QUICK=false
-RUN_MIRI=false
-READY_TO_RUN=false
-WEB_BUILD=false
+DO_FMT=false DO_CLIPPY=false DO_CLIPPY_FIX=false DO_LEN=false DO_UNIT=false
+DO_TEST=false DO_MIRI=false DO_BUILD=false DO_RUN=false WEB=false ASSUME_YES=false
 
 TMP_RS_FILES=""
-cleanup() {
-	[ -n "$TMP_RS_FILES" ] && rm -f "$TMP_RS_FILES"
-	return 0
-}
-trap cleanup EXIT INT TERM
+trap '[ -n "$TMP_RS_FILES" ] && rm -f "$TMP_RS_FILES"; exit' EXIT INT TERM
 
 usage() {
-	cat <<'EOF'
-Usage: $0 [-y | -c | -n | -q | -r] [--web]
-  -y      Run all checks and tests (including Miri), then build
-  -c      Like -y but WITHOUT Miri
-  -n      Skip everything except build
-  -q      Quick: only unit tests (cargo test --lib), then build
-  -r      Same as -y; on native it then runs the app, on --web it prints a
-          "ready to run in release" hint (WASM can't be executed directly)
-  --web   Use the WASM pipeline (wasm-pack) instead of the native cargo one
-  -h      Show this help
+	cat <<EOF
+Usage: $(basename "$0") [-fcClutmbra] [-wy] [-h]
+Everything is OFF by default; pick what you want. Flags can be bundled (-ub).
+Steps always run in this order: f c l u t m b r
+
+  -f  format          cargo fmt (creates $RUSTFMT_TOML if missing)
+  -c  clippy + fix    cargo clippy --fix with a git safety net
+                      (commit, then keep / uncommit / rollback)
+  -C  clippy check    cargo clippy only, no changes
+  -l  lengths         warn on .rs files > $MAX_FILE_LINES lines or lines > $MAX_LINE_WIDTH chars
+  -u  unit tests      cargo test --lib
+  -t  all tests       cargo test (+ wasm-pack headless Firefox tests with -w)
+  -m  miri            cargo +nightly miri test --lib
+  -b  build           cargo build --release (wasm-pack build with -w)
+  -r  run             cargo run --release (with -w: prints how to serve pkg/)
+  -a  all             f c l t m b  (everything except run)
+
+  -w  web             use the WASM pipeline (installs wasm-pack/target if needed)
+  -y  yes             non-interactive: never prompt, clippy fixes are kept
+  -h  help
+
+Examples:
+  $(basename "$0") -u          only unit tests
+  $(basename "$0") -c          run clippy and fix the warnings
+  $(basename "$0") -fcub       format, clippy fix, unit tests, build
+  $(basename "$0") -awr        everything on web, then print serve hint
+
+Non-fatal (warn and continue): tests, miri.  Fatal: fmt, clippy, build.
+Clippy never adds #[allow(..)]; only MachineApplicable fixes are applied.
 EOF
 }
 
-# run_tolerant <description> <cmd> [args...]
-# Runs a command; on non-zero exit, prints a WARNING with the description and
-# exit code but does not abort the script (even under `set -e`), and always
-# returns 0. This is the "keep going, just warn" pattern the original script
-# repeated three times with a manual set +e / set -e dance.
-run_tolerant() {
-	_rt_desc=$1
-	shift
-	_rt_status=0
-	"$@" || _rt_status=$?
-	if [ "$_rt_status" -ne 0 ]; then
-		echo "==> WARNING: $_rt_desc (exit $_rt_status). Continuing anyway."
-	fi
-	return 0
-}
-
-# require_cmd <cmd> <hint>
-require_cmd() {
-	command -v "$1" >/dev/null 2>&1 || {
-		echo "ERROR: $1 not found. $2"
-		exit 1
-	}
+set_flag() {
+	case "$1" in
+		f) DO_FMT=true ;;
+		c) DO_CLIPPY=true; DO_CLIPPY_FIX=true ;;
+		C) DO_CLIPPY=true ;;
+		l) DO_LEN=true ;;
+		u) DO_UNIT=true ;;
+		t) DO_TEST=true ;;
+		m) DO_MIRI=true ;;
+		b) DO_BUILD=true ;;
+		r) DO_RUN=true ;;
+		a) DO_FMT=true; DO_CLIPPY=true; DO_CLIPPY_FIX=true; DO_LEN=true; DO_TEST=true; DO_MIRI=true; DO_BUILD=true ;;
+		w) WEB=true ;;
+		y) ASSUME_YES=true ;;
+		h) usage; exit 0 ;;
+		*) echo "ERROR: unknown option -$1" >&2; usage >&2; exit 1 ;;
+	esac
 }
 
 parse_args() {
-	while [ $# -gt 0 ]; do
-		case "$1" in
-			-y) RUN_ALL=true; RUN_MIRI=true ;;
-			-c) RUN_ALL=true ;;
-			-n) SKIP_ALL=true ;;
-			-q) QUICK=true ;;
-			-r) RUN_ALL=true; RUN_MIRI=true; READY_TO_RUN=true ;;
-			--web) WEB_BUILD=true ;;
-			-h|--help) usage; exit 0 ;;
-			*) usage; exit 1 ;;
+	[ $# -eq 0 ] && { usage; exit 1; }
+	for arg in "$@"; do
+		case "$arg" in
+			--web) set_flag w ;;
+			--yes) set_flag y ;;
+			--help) set_flag h ;;
+			-?*)
+				rest=${arg#-}
+				while [ -n "$rest" ]; do
+					set_flag "${rest%"${rest#?}"}"
+					rest=${rest#?}
+				done ;;
+			*) echo "ERROR: unexpected argument '$arg'" >&2; usage >&2; exit 1 ;;
 		esac
-		shift
 	done
-
-	if ! $RUN_ALL && ! $SKIP_ALL && ! $QUICK; then
-		usage
-		exit 1
+	if [ ! -t 0 ] && ! $ASSUME_YES; then
+		echo "==> stdin is not a terminal; running non-interactively (-y implied)."
+		ASSUME_YES=true
 	fi
+}
+
+run_tolerant() {
+	_desc=$1
+	shift
+	_st=0
+	"$@" || _st=$?
+	[ "$_st" -eq 0 ] || echo "==> WARNING: $_desc (exit $_st). Continuing anyway."
+	return 0
+}
+
+require_cmd() {
+	command -v "$1" >/dev/null 2>&1 || { echo "ERROR: $1 not found. $2"; exit 1; }
 }
 
 check_prereqs() {
@@ -101,14 +107,12 @@ check_prereqs() {
 		echo "       Run this script from the root of a Rust (Cargo) project."
 		exit 1
 	fi
-
-	echo "==> Checking prerequisites..."
 	require_cmd cargo "Install from https://rustup.rs"
 	require_cmd rustup "Install from https://rustup.rs"
 
-	if $WEB_BUILD; then
+	if $WEB && { $DO_TEST || $DO_BUILD; }; then
 		if ! command -v wasm-pack >/dev/null 2>&1; then
-			echo "INFO: Installing wasm-pack..."
+			echo "==> Installing wasm-pack..."
 			cargo install wasm-pack
 		fi
 		echo "==> Adding wasm32 target..."
@@ -117,10 +121,12 @@ check_prereqs() {
 }
 
 setup_rustfmt_toml() {
-	if [ ! -f "$RUSTFMT_TOML" ]; then
-		echo "==> Creating $RUSTFMT_TOML"
-		cat > "$RUSTFMT_TOML" <<'EOF2'
-# Stable rustfmt configuration
+	if [ -f "$RUSTFMT_TOML" ]; then
+		echo "==> Using existing $RUSTFMT_TOML"
+		return 0
+	fi
+	echo "==> Creating $RUSTFMT_TOML"
+	cat > "$RUSTFMT_TOML" <<'EOF2'
 hard_tabs = true
 tab_spaces = 4
 max_width = 150
@@ -131,115 +137,202 @@ use_field_init_shorthand = true
 use_try_shorthand = true
 use_small_heuristics = "Max"
 EOF2
+}
+
+do_fmt() {
+	setup_rustfmt_toml
+	echo "==> Running cargo fmt"
+	cargo fmt --all
+}
+
+ask_yn() {
+	while true; do
+		printf '%s [y/N] ' "$1"
+		read -r _ans || _ans=""
+		case "$(printf '%s' "${_ans:-n}" | tr '[:upper:]' '[:lower:]')" in
+			y|yes) return 0 ;;
+			n|no) return 1 ;;
+			*) echo "  please answer y or n" ;;
+		esac
+	done
+}
+
+ask_three_way() {
+	while true; do
+		printf '%s\n  [k]eep commit / [u]ncommit (keep changes) / [r]ollback [k]: ' "$1"
+		read -r _ans || _ans=""
+		case "$(printf '%s' "${_ans:-k}" | tr '[:upper:]' '[:lower:]')" in
+			k|keep) REPLY=k; return 0 ;;
+			u|un|uncommit) REPLY=u; return 0 ;;
+			r|rb|rollback) REPLY=r; return 0 ;;
+			*) echo "  please answer k, u, or r" ;;
+		esac
+	done
+}
+
+in_git_repo() { [ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" = "true" ]; }
+
+tree_is_clean() { ! git status --porcelain 2>/dev/null | grep -qv '^??'; }
+
+confirm_or_abort() {
+	$ASSUME_YES && return 0
+	ask_yn "$1" || { echo "==> aborted."; exit 1; }
+}
+
+clippy_check() {
+	_out=$(cargo clippy --all-targets -- -D warnings 2>&1) || {
+		printf '%s\n' "$_out" >&2
+		echo "==> WARNING: clippy still reports issues (manual review needed)." >&2
+		return 1
+	}
+	echo "==> clippy clean."
+}
+
+clippy_fix() {
+	use_git=false
+	restore=""
+	committed=false
+	changed=false
+
+	if ! command -v git >/dev/null 2>&1 || ! in_git_repo; then
+		echo "warn: no git repository; no automatic rollback." >&2
+		confirm_or_abort "Proceed anyway?"
+	elif ! tree_is_clean; then
+		echo "warn: git work tree has uncommitted changes; commit or stash first for a safety net." >&2
+		confirm_or_abort "Proceed WITHOUT a safety net?"
+	elif ! restore=$(git rev-parse HEAD 2>/dev/null) || [ -z "$restore" ]; then
+		echo "warn: could not resolve HEAD; no safety net." >&2
+		confirm_or_abort "Proceed anyway?"
 	else
-		echo "==> Using existing $RUSTFMT_TOML"
+		use_git=true
+		echo "==> safety net: pre-run HEAD $(printf '%.12s' "$restore")"
+	fi
+
+	i=1
+	while [ "$i" -le "$MAX_FIX_ITER" ]; do
+		before=""
+		$use_git && before=$(git status --porcelain 2>/dev/null || echo "")
+		cargo clippy --fix --allow-no-vcs --allow-dirty --allow-staged --all-targets -- -D warnings || true
+		changed=true
+		if $use_git; then
+			after=$(git status --porcelain 2>/dev/null || echo "")
+			[ "$before" = "$after" ] && { changed=false; break; }
+		else
+			break
+		fi
+		i=$((i + 1))
+	done
+
+	if $use_git && $changed; then
+		echo ""
+		echo "=== changes vs. pre-run state ==="
+		git --no-pager diff --stat "$restore" || true
+		git --no-pager diff "$restore" || true
+		echo "=== end diff ==="
+		echo ""
+
+		if git commit -am "$CLIPPY_MSG" >/dev/null 2>&1; then
+			committed=true
+			echo "==> committed: $CLIPPY_MSG"
+		else
+			echo "warn: commit failed (pre-commit hook?); changes stay uncommitted." >&2
+		fi
+
+		if $ASSUME_YES; then REPLY=k; else ask_three_way "What next?"; fi
+
+		case "$REPLY" in
+			k) echo "==> kept." ;;
+			u)
+				if $committed && git reset HEAD~1 >/dev/null 2>&1; then
+					echo "==> uncommitted (changes preserved in work tree)."
+				else
+					echo "warn: nothing uncommitted (no commit, or reset failed)." >&2
+				fi ;;
+			r)
+				if git reset --hard "$restore" >/dev/null 2>&1; then
+					echo "==> rolled back to $(printf '%.12s' "$restore")."
+					return 0
+				fi
+				echo "error: rollback failed; restore manually with: git reset --hard $restore" >&2
+				exit 1 ;;
+		esac
+	elif $use_git; then
+		echo "==> no fixes to apply."
+	else
+		echo "==> fixes applied (no rollback available); review and commit manually."
+	fi
+
+	clippy_check
+}
+
+do_clippy() {
+	if $DO_CLIPPY_FIX; then
+		echo "==> Running cargo clippy (auto-fix)"
+		clippy_fix
+	else
+		echo "==> Running cargo clippy (check only)"
+		clippy_check
 	fi
 }
 
-# check_lengths: warns about .rs files/lines that are too long.
-# Rewritten from `find ... | while read ...` to `find ... > tmp; while read
-# ... done < tmp` so a failing `find` (e.g. unreadable directory) still trips
-# `set -e` and aborts the script, the same way it would under bash+pipefail.
-# With the old pipe form, on plain POSIX sh (no pipefail) a `find` failure was
-# silently swallowed because the pipeline's exit status was that of the
-# `while` loop, not `find`.
-check_lengths() {
+do_lengths() {
+	echo "==> Checking file and line length (warnings only)"
 	TMP_RS_FILES=$(mktemp 2>/dev/null) || TMP_RS_FILES="${TMPDIR:-/tmp}/build-rs-files.$$"
 	find . -type f -name "*.rs" ! -path "./target/*" > "$TMP_RS_FILES"
 	while IFS= read -r file; do
-		total_lines=$(wc -l < "$file")
-		if [ "$total_lines" -gt "$MAX_FILE_LINES" ]; then
-			echo "WARN: $file has $total_lines lines (limit: $MAX_FILE_LINES) — consider splitting into submodules"
-		fi
-		awk -v file="$file" -v max="$MAX_LINE_WIDTH" '
-			length($0) > max {
-				printf "WARN: %s:%d exceeds %d chars (%d)\n", file, NR, max, length($0)
-			}
-		' "$file"
+		total=$(wc -l < "$file")
+		[ "$total" -gt "$MAX_FILE_LINES" ] && echo "WARN: $file has $total lines (limit: $MAX_FILE_LINES) — consider splitting into submodules"
+		awk -v file="$file" -v max="$MAX_LINE_WIDTH" \
+			'length($0) > max { printf "WARN: %s:%d exceeds %d chars (%d)\n", file, NR, max, length($0) }' "$file"
 	done < "$TMP_RS_FILES"
 	rm -f "$TMP_RS_FILES"
 	TMP_RS_FILES=""
 }
 
-run_lint() {
-	echo "==> Running cargo fmt"
-	cargo fmt --all
-
-	echo "==> Running cargo clippy"
-	cargo clippy --all-targets -- -D warnings
-
-	echo "==> Checking file and line length (warnings only)"
-	check_lengths
+do_unit() {
+	echo "==> Running unit tests (cargo test --lib)"
+	run_tolerant "unit tests failed" cargo test --lib
 }
 
-run_quick_tests() {
-	echo "==> Running pure-logic tests (cargo test --lib)..."
-	run_tolerant "pure-logic tests failed" cargo test --lib
-}
-
-run_full_tests() {
-	echo "==> Running all tests (unit, integration, docs)..."
+do_test() {
+	echo "==> Running all tests (unit, integration, docs)"
 	run_tolerant "full test suite failed" cargo test
-
-	if $WEB_BUILD; then
-		echo "==> Running DOM-backed tests (wasm-pack test --headless --firefox)..."
+	if $WEB; then
+		echo "==> Running DOM-backed tests (wasm-pack test --headless --firefox)"
 		run_tolerant "DOM-backed tests failed or the browser driver could not run" wasm-pack test --headless --firefox
 	fi
-
-	if $RUN_MIRI; then
-		run_miri
-	else
-		echo "==> Skipping Miri (-c flag)."
-	fi
 }
 
-run_miri() {
+do_miri() {
 	if command -v cargo-miri >/dev/null 2>&1 || cargo +nightly miri --version >/dev/null 2>&1; then
 		echo "==> Running cargo miri test --lib"
-		run_tolerant "cargo miri test --lib failed or found UB — investigate before trusting unsafe code" \
+		run_tolerant "miri failed or found UB — investigate before trusting unsafe code" \
 			env MIRIFLAGS="-Zmiri-disable-isolation" cargo +nightly miri test --lib
 	else
 		echo "==> Skipping Miri (nightly + 'miri' rustup component not found)"
 	fi
 }
 
-run_checks_and_tests() {
-	if $SKIP_ALL; then
-		echo "==> Skipping all checks and tests (-n flag)."
-		return 0
-	fi
-
-	$QUICK || run_lint
-
-	if $RUN_ALL; then
-		run_full_tests
-	else
-		run_quick_tests
-	fi
-}
-
 do_build() {
-	if $WEB_BUILD; then
-		echo "==> Building release (wasm-pack --target web)..."
+	if $WEB; then
+		echo "==> Building release (wasm-pack --target web)"
 		wasm-pack build --target web --release
 		echo "==> Build complete. Output in pkg/"
 	else
-		echo "==> Building release..."
+		echo "==> Building release"
 		cargo build --release
-		echo "==> Build complete. Binary available at target/release/app."
+		echo "==> Build complete. Binary available in target/release/"
 	fi
 }
 
-do_ready_to_run() {
-	$READY_TO_RUN || return 0
-
-	if $WEB_BUILD; then
-		echo "==> Ready to run in release."
-		echo "    Serve the generated bundle, e.g.:"
+do_run() {
+	if $WEB; then
+		[ -d pkg ] || echo "==> WARNING: pkg/ not found; add -b to build first."
+		echo "==> WASM can't be executed directly. Serve the bundle, e.g.:"
 		echo "      python3 -m http.server 8000 --directory pkg"
 		echo "    Then open http://localhost:8000/ in your browser."
 	else
-		echo "==> Running app (cargo run --release)..."
+		echo "==> Running app (cargo run --release)"
 		cargo run --release
 	fi
 }
@@ -247,10 +340,15 @@ do_ready_to_run() {
 main() {
 	parse_args "$@"
 	check_prereqs
-	setup_rustfmt_toml
-	run_checks_and_tests
-	do_build
-	do_ready_to_run
+	$DO_FMT && do_fmt
+	$DO_CLIPPY && do_clippy
+	$DO_LEN && do_lengths
+	$DO_UNIT && do_unit
+	$DO_TEST && do_test
+	$DO_MIRI && do_miri
+	$DO_BUILD && do_build
+	$DO_RUN && do_run
+	return 0
 }
 
 main "$@"

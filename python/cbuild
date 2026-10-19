@@ -1,39 +1,51 @@
 #!/usr/bin/env python
 """
-merge_c.py -- merge multiple C/C++ sources+headers into a single file.
+cbuild.py -- merge C/C++ sources into ONE translation unit, compile it, run it.
 
-What it does
-------------
-* Inlines local #include "..." files IN PLACE (first occurrence wins, later
-  ones are dropped), so macro/definition order is preserved.
-* Hoists unconditional system includes (<...>) to the top, deduplicated, in
-  first-seen order.  Includes inside #if/#ifdef blocks stay where they are.
-  Feature-test defines (_GNU_SOURCE, WIN32_LEAN_AND_MEAN, ...) are hoisted
-  above them.
-* Folds trivially constant conditionals:  #if 0 / #if 1 / #else / #endif
-  (dead branches are removed, line numbers are preserved with blank lines).
-  Anything involving macros is left alone -- that would need a real
-  preprocessor.
-* Renames `static` functions whose name is also defined in another file, so
-  they cannot collide in the merged translation unit
-  (<file>_<name>).  Strings, comments, and struct members (a.name, p->name)
-  are never touched.
-* C -> C++ helper (--const-strings): when the output is a C++ file but all
-  the inputs are C, tries to turn `char *` into `const char *` where that is
-  provably (heuristically, but conservatively) safe, so string literals do
-  not produce warnings/errors:
-      - parameters of functions that never write through them
-      - variables initialised only with string literals
-          char *msg = "hi";            char *names[] = {"a", "b"};
-  Prototypes are updated to match.  Anything the analysis can't prove safe
-  is left unchanged.
+Pipeline (always in this order, one step):  combine -> compile -> run
 
-Usage
------
-    merge_c.py -o out.c   a.c b.c c.c
-    merge_c.py -o out.cpp a.c b.c            # C sources -> C++, const fixes
-    merge_c.py -o out.cpp a.c --const-strings off
-    merge_c.py -o out.c a.c -I include --line
+    cbuild.py [options] INPUT... [-- PROGRAM_ARGS...]
+
+Options
+-------
+  -m, -main FN      Entry function.  FN is never renamed by the merger.  If FN
+                    is not "main", every input's own main() is renamed out of
+                    the way (__unused_main_<i>__) and a driver
+                    `int main(void){ return FN(); }` is appended.
+  -o, -out EXE      Keep the executable here (default: temp file, deleted).
+  -c, -combine FILE Keep the merged source here (default: temp file, deleted).
+                    Extension .cpp/.cc/... makes the target C++.
+  -r, -run          Toggle: running is ON by default, passing -r turns it OFF.
+  -Xcc FLAG         Extra compiler/linker flag (repeatable): -Xcc -O3 ...
+
+Merge options (same as merge_c.py)
+----------------------------------
+  -I, --include-dir DIR   extra include search dir
+  --inline-angle          also inline <...> includes found in an -I dir
+  --no-rename             do not rename colliding static functions
+  --rename-all-static     prefix every static function
+  --const-strings {auto,on,off}   char* -> const char* (C sources -> C++)
+  --lang {c,cpp}          target language (default: from -c ext / sources)
+  --line                  emit #line directives
+  --dry-run               merge only; write/compile/run nothing
+  --strict                exit non-zero if the merger warned
+
+What merging does
+-----------------
+* Inlines local #include "..." files in place (first occurrence wins).
+* Hoists unconditional system includes / feature-test defines to the top.
+* Folds trivially constant #if 0 / #if 1 chains.
+* Renames `static` functions defined in more than one file (<file>_<name>).
+  Strings, comments and struct members are never touched.
+* --const-strings: conservative `char *` -> `const char *` fixes.
+
+Examples
+--------
+    cbuild.py a.c b.c                       # merge, build, run (all temp)
+    cbuild.py -m app a.c b.c -Xcc -O3       # run app() instead of main()
+    cbuild.py -c all.c a.c b.c -r           # just produce all.c (and a built temp)
+    cbuild.py -c all.c -o prog -m app a.c b.c
+    cbuild.py a.c -- arg1 arg2              # args passed to the program
 """
 
 from __future__ import print_function
@@ -43,6 +55,9 @@ import os
 import re
 import argparse
 import io
+import shutil
+import subprocess
+import tempfile
 
 # ------------------------------------------------------------------ constants
 
@@ -485,7 +500,7 @@ def apply_rename(text, cs, ren, skip_spans=()):
     return ''.join(pieces)
 
 
-def rename_statics(units, rename_all):
+def rename_statics(units, rename_all, keep=()):
     defs, info = {}, {}
     for u in units:
         cs = mask_cs(u.text)
@@ -505,7 +520,7 @@ def rename_statics(units, rename_all):
         ren = {}
         for f in funcs:
             nm = f['name']
-            if f['static'] and nm not in NEVER_RENAME and \
+            if f['static'] and nm not in NEVER_RENAME and nm not in keep and \
                     (rename_all or defs[nm] - {id(u)}):
                 ren[nm] = "{}_{}".format(pre, nm)
         if ren:
@@ -823,49 +838,105 @@ def constify(text):
 
 # ---------------------------------------------------------------------- main
 
+def split_argv(argv):
+    """Pull out `-Xcc FLAG` pairs and `-- PROG_ARGS`; map -main etc. aliases."""
+    prog_args = []
+    if '--' in argv:
+        k = argv.index('--')
+        argv, prog_args = argv[:k], argv[k + 1:]
+    alias = {'-main': '-m', '-out': '-o', '-combine': '-c', '-run': '-r'}
+    rest, xcc, i = [], [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a == '-Xcc':
+            if i + 1 >= len(argv):
+                sys.exit("error: -Xcc requires an argument")
+            xcc.append(argv[i + 1])
+            i += 2
+            continue
+        rest.append(alias.get(a, a))
+        i += 1
+    return rest, xcc, prog_args
+
+
+def rename_mains(units):
+    for i, u in enumerate(units):
+        cs = mask_cs(u.text)
+        u.text = apply_rename(u.text, cs, {'main': '__unused_main_%d__' % i})
+
+
+def find_entry(units, fn):
+    for u in units:
+        funcs, _, _ = scan_top_level(blank_pp(mask_cs(u.text)))
+        for f in funcs:
+            if f['name'] == fn:
+                a, b = f['params']
+                return f, len(split_params(blank_pp(mask_cs(u.text)), a, b))
+    return None, 0
+
+
 def main():
     ap = argparse.ArgumentParser(
-        description=__doc__,
+        description=__doc__, prog='cbuild.py',
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('-o', '--output', required=True)
-    ap.add_argument('-I', '--include-dir', action='append', default=[],
-                    help='extra dir to search for includes')
-    ap.add_argument('--inline-angle', action='store_true',
-                    help='also inline <...> includes that resolve in an -I dir')
-    ap.add_argument('--no-rename', action='store_true',
-                    help='do not rename colliding static functions')
-    ap.add_argument('--rename-all-static', action='store_true',
-                    help='prefix every static function, not just colliding')
+    ap.add_argument('-m', '--main', metavar='FN', help='entry function')
+    ap.add_argument('-o', '--out', metavar='EXE', help='keep executable here')
+    ap.add_argument('-c', '--combine', metavar='FILE',
+                    help='keep merged source here')
+    ap.add_argument('-r', '--run', dest='no_run', action='store_true',
+                    help='toggle: run is ON by default; pass to NOT run')
+    ap.add_argument('-I', '--include-dir', action='append', default=[])
+    ap.add_argument('--inline-angle', action='store_true')
+    ap.add_argument('--no-rename', action='store_true')
+    ap.add_argument('--rename-all-static', action='store_true')
     ap.add_argument('--const-strings', choices=['auto', 'on', 'off'],
-                    default='auto',
-                    help='char* -> const char* (auto: output is C++ and all '
-                         'inputs are C)')
-    ap.add_argument('--lang', choices=['c', 'cpp'], default=None,
-                    help='target language (default: from output extension)')
-    ap.add_argument('--line', action='store_true',
-                    help='emit #line directives pointing at original files')
+                    default='auto')
+    ap.add_argument('--lang', choices=['c', 'cpp'], default=None)
+    ap.add_argument('--line', action='store_true')
     ap.add_argument('--dry-run', action='store_true')
-    ap.add_argument('--strict', action='store_true',
-                    help='exit non-zero if any warning was printed')
+    ap.add_argument('--strict', action='store_true')
     ap.add_argument('files', nargs='+')
-    args = ap.parse_args()
 
-    out_real = os.path.realpath(args.output)
+    rest, xcc, prog_args = split_argv(sys.argv[1:])
+    args = ap.parse_args(rest)
+
+    comb_real = os.path.realpath(args.combine) if args.combine else None
     for f in args.files:
         if not os.path.isfile(f):
             sys.exit("error: {}: no such file".format(f))
-        if os.path.realpath(f) == out_real:
-            sys.exit("error: output {} is also an input".format(args.output))
+        if comb_real and os.path.realpath(f) == comb_real:
+            sys.exit("error: combine file {} is also an input".format(f))
+
+    entry = args.main if args.main and args.main != 'main' else None
 
     ctx = Ctx(args)
     roots = [u for u in (load_unit(f, ctx) for f in args.files) if u]
 
+    driver = None
+    if entry:
+        rename_mains(ctx.units)
+        fdef, nparams = find_entry(ctx.units, entry)
+        if not fdef:
+            sys.exit("error: entry function {}() not found".format(entry))
+        if nparams:
+            ctx.warn("{}() takes parameters; driver calls it with none"
+                     .format(entry))
+        pre = re.sub(r'\b(static|inline|extern|__inline__?|const)\b', '',
+                     fdef['prefix'])
+        is_void = bool(re.search(r'\bvoid\b', pre)) and '*' not in pre
+        call = ("    {}();\n    return 0;" if is_void
+                else "    return {}();").format(entry)
+        driver = ("/* ===== auto-generated driver: calls {0}() ===== */\n"
+                  "int main(void) {{\n{1}\n}}\n").format(entry, call)
+
     if not args.no_rename:
-        rename_statics(ctx.units, args.rename_all_static)
+        rename_statics(ctx.units, args.rename_all_static,
+                       keep=(entry,) if entry else ())
 
     src_cpp = any(os.path.splitext(u.path)[1].lower() in CPP_EXTS
                   for u in ctx.units)
-    out_cpp = os.path.splitext(args.output)[1].lower() in CPP_EXTS
+    out_cpp = bool(args.combine) and \
+        os.path.splitext(args.combine)[1].lower() in CPP_EXTS
     target = args.lang or ('cpp' if (out_cpp or src_cpp) else 'c')
 
     body = []
@@ -882,13 +953,20 @@ def main():
         args.const_strings == 'auto' and target == 'cpp' and not src_cpp)
     if do_const:
         body_text, changed, skipped = constify(body_text)
-        print("  const char*: {} converted, {} left unchanged".format(len(changed), len(skipped)), file=sys.stderr)
+        print("  const char*: {} converted, {} left unchanged".format(
+            len(changed), len(skipped)), file=sys.stderr)
         for c in changed:
             print("    + {}".format(c), file=sys.stderr)
         for c in skipped:
-            print("    - {} (not provably read-only)".format(c), file=sys.stderr)
+            print("    - {} (not provably read-only)".format(c),
+                  file=sys.stderr)
 
-    head = ["/* generated by merge_c.py ({}) */".format(target), ""]
+    if driver:
+        if args.line:
+            body_text += '\n#line 1 "cbuild-driver"\n'
+        body_text += "\n" + driver
+
+    head = ["/* generated by cbuild.py ({}) */".format(target), ""]
     if ctx.prelude:
         for line in ctx.prelude:
             dm = re.match(r'\s*#\s*define\s+(\w+)\s*$', line)
@@ -897,24 +975,55 @@ def main():
         head.append("")
     if ctx.sys_includes:
         head += ["#include <{}>".format(i) for i in ctx.sys_includes] + [""]
-
-    if args.dry_run:
-        print("dry run: nothing written", file=sys.stderr)
-    else:
-        content = "\n".join(head) + "\n" + body_text
-        try:
-            out_bytes = content.encode('utf-8', 'surrogateescape')
-        except (LookupError, TypeError):
-            out_bytes = content.encode('utf-8', 'replace')
-        with io.open(args.output, 'wb') as f:
-            f.write(out_bytes)
-            if not body_text.endswith('\n'):
-                f.write(b'\n')
-        print("wrote {}".format(args.output), file=sys.stderr)
+    content = "\n".join(head) + "\n" + body_text
+    if not content.endswith('\n'):
+        content += '\n'
 
     if args.strict and ctx.warnings:
         sys.exit(1)
+    if args.dry_run:
+        print("dry run: nothing written", file=sys.stderr)
+        return 0
+
+    try:
+        out_bytes = content.encode('utf-8', 'surrogateescape')
+    except (LookupError, TypeError):
+        out_bytes = content.encode('utf-8', 'replace')
+
+    tmp = tempfile.mkdtemp(prefix='cbuild_')
+    try:
+        ext = '.cpp' if target == 'cpp' else '.c'
+        csrc = args.combine or os.path.join(tmp, 'combined' + ext)
+        with io.open(csrc, 'wb') as f:
+            f.write(out_bytes)
+        if args.combine:
+            print("wrote {}".format(csrc), file=sys.stderr)
+
+        exe = args.out or os.path.join(tmp, 'a.out')
+        if target == 'cpp':
+            cc, lang = os.environ.get('CXX', 'g++'), 'c++'
+        else:
+            cc, lang = os.environ.get('CC', 'gcc'), 'c'
+        cmd = [cc, '-x', lang, csrc, '-o', exe,
+               '-W', '-Wall', '-Wextra', '-pedantic']
+        cmd += ['-I' + d for d in args.include_dir] + xcc + ['-lm']
+        print("Compiling {} -> {}".format(
+            csrc, args.out or "temp binary"), file=sys.stderr)
+        rc = subprocess.call(cmd)
+        if rc != 0:
+            print("error: compile failed ({})".format(rc), file=sys.stderr)
+            return rc
+        if args.out:
+            print("wrote {}".format(exe), file=sys.stderr)
+
+        if args.no_run:
+            return 0
+        exe_path = os.path.abspath(exe)
+        sys.stdout.flush()
+        return subprocess.call([exe_path] + prog_args)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

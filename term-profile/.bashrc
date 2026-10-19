@@ -8,6 +8,12 @@ if [[ $- == *i* ]]; then
     echo "Today is $(date)"
     # disable old xoff/xon
     stty -ixon
+    
+	# Better completion behavior
+	bind 'set show-all-if-ambiguous on'
+	bind 'set completion-ignore-case on'
+	bind 'set colored-stats on'
+	bind 'TAB:menu-complete'
 fi
 
 # Uncomment the following line if you don't like systemctl's auto-paging feature:
@@ -30,12 +36,6 @@ if ! shopt -oq posix; then
         . /etc/bash_completion
     fi
 fi
-
-# Better completion behavior
-[[ $- == *i* ]] && bind 'set show-all-if-ambiguous on'
-[[ $- == *i* ]] && bind 'set completion-ignore-case on'
-[[ $- == *i* ]] && bind 'set colored-stats on'
-[[ $- == *i* ]] && bind 'TAB:menu-complete'
 
 # Set custom prompt
 export PS1="\[\e[32m\]\u\[\e[0m\]:\[\e[34m\]\w\[\e[0m\]$ "
@@ -73,6 +73,7 @@ alias ll='ls -la'
 alias la='ls -A'
 
 alias gp='git pull'
+alias gps='git push'
 alias gf='git fetch'
 alias gc='git commit'
 alias gch='git checkout'

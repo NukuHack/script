@@ -61,4 +61,7 @@ Python basics.
 
 - just the stuff i surce my terminal with
 
+# docs
+
+- some stuff i need at "git init" ..
 

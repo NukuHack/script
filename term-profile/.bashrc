@@ -57,6 +57,7 @@ alias ssh-elte='ssh i7zbe7@szamrend.inf.elte.hu'
 alias idea="/opt/idea/bin/idea"
 alias du-l='du -sh -- * .[!.]* 2>/dev/null | sort -h'
 alias df-l='df -lha'
+alias md='patine README.md --ascii | less -R'
 alias re-source="source ~/.bashrc"
 alias re-source-f="exec bash -l"
 

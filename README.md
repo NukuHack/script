@@ -53,7 +53,8 @@ Python basics.
 | `macro` | A simple (Linux) macro I use. |
 | `combine` | A simple combiner (folders to txt). |
 | `build` | A basic rust run script |
-| `cleanup` | A small script for cleaning out old files|
+| `cleanup` | A small script for cleaning out old files |
+| `sshddd` | Proxy through SSH |
 
 ---
 

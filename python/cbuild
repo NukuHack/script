@@ -16,7 +16,10 @@ Options
   -c, -combine FILE Keep the merged source here (default: temp file, deleted).
                     Extension .cpp/.cc/... makes the target C++.
   -r, -run          Toggle: running is ON by default, passing -r turns it OFF.
-  -Xcc FLAG         Extra compiler/linker flag (repeatable): -Xcc -O3 ...
+  -Xcc FLAG...      Extra compiler/linker flags.  Consumes every following
+                    -flag until the next cbuild option (or `--` / a
+                    non-flag argument like a filename).  Repeatable:
+                    -Xcc -O3 -std=c99 -g
 
 Merge options (same as merge_c.py)
 ----------------------------------
@@ -839,20 +842,38 @@ def constify(text):
 # ---------------------------------------------------------------------- main
 
 def split_argv(argv):
-    """Pull out `-Xcc FLAG` pairs and `-- PROG_ARGS`; map -main etc. aliases."""
+    """Pull out `-Xcc FLAG...` and `-- PROG_ARGS`; map -main etc. aliases."""
     prog_args = []
     if '--' in argv:
         k = argv.index('--')
         argv, prog_args = argv[:k], argv[k + 1:]
     alias = {'-main': '-m', '-out': '-o', '-combine': '-c', '-run': '-r'}
+    cbuild_opts = {
+        '-m', '--main', '-o', '--out', '-c', '--combine', '-r', '--run',
+        '-I', '--include-dir', '--inline-angle', '--no-rename',
+        '--rename-all-static', '--const-strings', '--lang', '--line',
+        '--dry-run', '--strict', '-Xcc',
+        '-main', '-out', '-combine', '-run',
+        '-h', '--help',
+    }
+
+    def is_own(arg):
+        return arg in cbuild_opts or (
+            '=' in arg and arg.split('=', 1)[0] in cbuild_opts)
+
     rest, xcc, i = [], [], 0
     while i < len(argv):
         a = argv[i]
         if a == '-Xcc':
-            if i + 1 >= len(argv):
-                sys.exit("error: -Xcc requires an argument")
-            xcc.append(argv[i + 1])
-            i += 2
+            i += 1
+            start = len(xcc)
+            # Slurp every -flag that isn't a cbuild option (or --foo=bar form).
+            while (i < len(argv) and argv[i].startswith('-')
+                   and not is_own(argv[i])):
+                xcc.append(argv[i])
+                i += 1
+            if len(xcc) == start:
+                sys.exit("error: -Xcc requires at least one argument")
             continue
         rest.append(alias.get(a, a))
         i += 1
@@ -1026,4 +1047,16 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        # Ctrl+C while the child program (or compiler) is running.
+        # subprocess.call() already reaps the child; main()'s finally
+        # block removes the temp dir.
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+        sys.stderr.write('\nclosed\n')
+        sys.stderr.flush()
+        sys.exit(130)

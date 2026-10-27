@@ -29,6 +29,9 @@ mkcd() {
     mkdir -p "$1" && cd "$1"
 }
 
+md() {
+    patine "$1" --ascii | less -R
+}
 # Extract any archive, whatever its type
 extract() {
     if [ -f "$1" ]; then

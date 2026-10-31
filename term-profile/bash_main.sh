@@ -133,6 +133,7 @@ mid() {
 export SDKMAN_DIR="$HOME/.sdkman"
 # binaries, native compiled stuff
 add_to_path_if_exists "$HOME/.bun/bin"
+add_to_path_if_exists "$HOME/Desktop"
 add_to_path_if_exists "$HOME/.local/bin"
 add_to_path_if_exists "$HOME/.local/script"
 add_to_path_if_exists "$HOME/Desktop/script/shell"

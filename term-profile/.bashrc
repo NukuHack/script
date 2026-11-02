@@ -51,13 +51,11 @@ alias ...='cd ../..'
 alias ....='cd ../../..'
 alias .....='cd ../../../..'
 
-alias desktop='cd ~/Desktop'
-alias sftp-elte='sftp i7zbe7@szamrend.inf.elte.hu'
-alias ssh-elte='ssh i7zbe7@szamrend.inf.elte.hu'
+alias desk='cd ~/Desktop'
 alias idea="/opt/idea/bin/idea"
 alias du-l='du -sh -- * .[!.]* 2>/dev/null | sort -h'
 alias df-l='df -lha'
-alias re-source="source ~/.bashrc"
+alias re-source="source ~/.bash_profile"
 alias re-source-f="exec bash -l"
 
 alias webp2='~/.local/share/wp2conv/target/release/wp2conv'
@@ -73,8 +71,12 @@ alias ll='ls -la'
 alias la='ls -A'
 
 alias gp='git pull'
+alias gst='git status'
+alias gpf='git reset --hard HEAD && git pull'
+alias ga='git add'
 alias gps='git push'
 alias gf='git fetch'
+alias gd='git diff'
 alias gc='git commit'
 alias gch='git checkout'
 

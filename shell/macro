@@ -99,7 +99,7 @@ ${B}TARGET${N}  ${D}what to send${N}
                    mouse shortcuts, e.g. key:l  key:r  key:m
 
 ${B}INTERVAL${N}  ${D}how to send it (default: 1)${N}
-  ${C}<seconds>${N}        repeat every N seconds, e.g. 2  0.5  0.05
+  ${C}<seconds>${N}        repeat every N seconds, e.g. 2  0.5  0.05  0.005
   ${C}h${N}, ${C}hold${N}          press and keep holding until paused
 
 ${B}CONTROLS${N}
@@ -110,12 +110,17 @@ ${B}CONTROLS${N}
 
 ${B}EXAMPLES${N}
   ${PROG} l 0.1          left-click 10 times per second
+  ${PROG} l 0.005        left-click 200 times per second
+  ${PROG} l 0.001        left-click as fast as the backend allows (~1000 Hz)
   ${PROG} space 2        tap space every 2 seconds
   ${PROG} w h            hold W (walk forward)
   ${PROG} r h            hold the right mouse button
   ${PROG} key:r 0.5      tap the letter R every half second
 
 ${B}NOTES${N}
+  - Sub-50ms intervals are batched inside one backend call (xdotool --repeat,
+    JXA loop, PowerShell inner loop) so the requested rate is actually hit
+    instead of being throttled by per-action process spawns.
   - Caps Lock being on can make the *target app* see capital letters.
     Games read key codes so it rarely matters; text fields will notice.
   - macOS: grant your terminal Accessibility permission
@@ -211,7 +216,7 @@ HOLD=0
 case $INTERVAL_LC in
     h|hold) HOLD=1; INTERVAL=1 ;;
     ''|.|*[!0-9.]*|*.*.*) die "invalid interval '$INTERVAL' (use seconds like 0.5, or 'h' to hold)" ;;
-    *) awk -v i="$INTERVAL" 'BEGIN{exit !(i >= 0.01)}' || die "interval must be at least 0.01 seconds" ;;
+    *) awk -v i="$INTERVAL" 'BEGIN{exit !(i >= 0.001)}' || die "interval must be at least 0.001 seconds" ;;
 esac
 
 KIND=key; BTN=none; LABEL=
@@ -258,6 +263,31 @@ mac_mouse() {
 # $1 = key code, $2 = "true,false" (tap) | "true" (down) | "false" (up)
 mac_key() {
     osascript -l JavaScript -e 'ObjC.import("ApplicationServices");['"$2"'].forEach(function(d){$.CGEventPost(0,$.CGEventCreateKeyboardEvent(null,'"$1"',d));$.usleep(15000);});' >/dev/null
+}
+# $1 = button idx, $2 = down type, $3 = up type, $4 = count, $5 = delay ms
+mac_mouse_repeat() {
+    osascript -l JavaScript -e '
+        ObjC.import("ApplicationServices");
+        var p=$.CGEventGetLocation($.CGEventCreate(null));
+        var idx='"$1"', dn='"$2"', up='"$3"', n='"$4"', d='"$5"';
+        for(var i=0;i<n;i++){
+            $.CGEventPost(0,$.CGEventCreateMouseEvent(null,dn,p,idx));
+            $.usleep(1000);
+            $.CGEventPost(0,$.CGEventCreateMouseEvent(null,up,p,idx));
+            if(i<n-1){ var w=d*1000-1000; if(w>0) $.usleep(w); }
+        }' >/dev/null
+}
+# $1 = key code, $2 = count, $3 = delay ms
+mac_key_repeat() {
+    osascript -l JavaScript -e '
+        ObjC.import("ApplicationServices");
+        var k='"$1"', n='"$2"', d='"$3"';
+        for(var i=0;i<n;i++){
+            $.CGEventPost(0,$.CGEventCreateKeyboardEvent(null,k,true));
+            $.usleep(1000);
+            $.CGEventPost(0,$.CGEventCreateKeyboardEvent(null,k,false));
+            if(i<n-1){ var w=d*1000-1000; if(w>0) $.usleep(w); }
+        }' >/dev/null
 }
 mac_btn_idx()  { case $BTN in left) M_IDX=0; M_DN=1;  M_UP=2;;  right) M_IDX=1; M_DN=3; M_UP=4;; middle) M_IDX=2; M_DN=25; M_UP=26;; esac; }
 
@@ -337,6 +367,35 @@ do_action() {
     esac
 }
 
+# $1 = count, $2 = delay between actions (ms)
+do_action_batch() {
+    sent=$((sent + $1))
+    case $BACKEND in
+        xdotool)
+            if [ "$KIND" = mouse ]; then
+                case $BTN in left) b=1;; middle) b=2;; right) b=3;; esac
+                if [ "$1" -le 1 ]; then
+                    xdotool click "$b"
+                else
+                    xdotool click --repeat "$1" --delay "$2" "$b"
+                fi
+            else
+                if [ "$1" -le 1 ]; then
+                    xdotool key "$K_X"
+                else
+                    xdotool key --repeat "$1" --delay "$2" "$K_X"
+                fi
+            fi ;;
+        macos)
+            if [ "$KIND" = mouse ]; then
+                mac_btn_idx
+                mac_mouse_repeat "$M_IDX" "$M_DN" "$M_UP" "$1" "$2"
+            else
+                mac_key_repeat "$K_MAC" "$1" "$2"
+            fi ;;
+    esac
+}
+
 release_action() {
     [ $HOLD = 1 ] || return 0
     case $BACKEND in
@@ -397,7 +456,7 @@ run_ps() {
 }
 
 run_windows() {
-    MS=$(awk -v i="$INTERVAL" 'BEGIN{printf "%d", i*1000}')
+    MS=$(awk -v i="$INTERVAL" 'BEGIN{printf "%d", i*1000+0.5}')
     if is_wsl; then
         wt=$(cd /mnt/c 2>/dev/null; "$PS" -NoProfile -Command '[IO.Path]::GetTempPath()' | tr -d '\r')
         WIN_DIR=$(wslpath -u "$wt")
@@ -416,32 +475,46 @@ Add-Type -Namespace M -Name U -MemberDefinition '
 [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
 [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
 [DllImport("user32.dll")] public static extern short GetKeyState(int vk);
-[DllImport("user32.dll")] public static extern short VkKeyScan(char ch);'
+[DllImport("user32.dll")] public static extern short VkKeyScan(char ch);
+[DllImport("winmm.dll")] public static extern uint timeBeginPeriod(uint period);
+[DllImport("winmm.dll")] public static extern uint timeEndPeriod(uint period);'
 $Z=[UIntPtr]::Zero
 if($Kind -eq 'key' -and $Vk -le 0){ $Vk = [M.U]::VkKeyScan([char]$Cc) -band 255 }
 $Ext = if(($Vk -ge 33 -and $Vk -le 40) -or $Vk -eq 45 -or $Vk -eq 46){1}else{0}
 $Dn=@{left=2;right=8;middle=32}; $Up=@{left=4;right=16;middle=64}
 function Press   { if($Kind -eq 'mouse'){[M.U]::mouse_event($Dn[$Btn],0,0,0,$Z)}else{[M.U]::keybd_event([byte]$Vk,0,$Ext,$Z)} }
 function Release { if($Kind -eq 'mouse'){[M.U]::mouse_event($Up[$Btn],0,0,0,$Z)}else{[M.U]::keybd_event([byte]$Vk,0,($Ext -bor 2),$Z)} }
-function Fire    { Press; if($Hold -eq 0){ Start-Sleep -Milliseconds 15; Release } }
+function Fire    { Press; if($Hold -eq 0){ [System.Threading.Thread]::Sleep(1); Release } }
 function Stamp   { (Get-Date).ToString('HH:mm:ss') }
 if($ReleaseOnly){ Release; exit }
+
+# 1 ms timer resolution so Thread.Sleep($Ms) and the poll loop don't get rounded
+# to ~15 ms - this is what lets high-frequency clicking actually hit its target.
+[M.U]::timeBeginPeriod(1) | Out-Null
+
 $on=$false; $n=0
 $prev=([M.U]::GetKeyState(0x14) -band 1) -eq 1
 $sw=[Diagnostics.Stopwatch]::StartNew(); $next=0
+# Poll often enough to land on the requested interval, without burning the CPU.
+$pollMs = [Math]::Max(1, [Math]::Min([int]($Ms / 2), 20))
+if($Hold -eq 1){ $pollMs = 20 }
 try{
   while($true){
+    $now = $sw.ElapsedMilliseconds
     $caps=([M.U]::GetKeyState(0x14) -band 1) -eq 1
     if($caps -ne $prev){
       $prev=$caps; $on=$caps
-      if($on){ Write-Host "$(Stamp) - RUNNING"; Fire; $n++; $next=$sw.ElapsedMilliseconds+$Ms }
+      if($on){ Write-Host "$(Stamp) - RUNNING"; Fire; $n++; $next=$now+$Ms }
       else   { Write-Host "$(Stamp) - PAUSED"; if($Hold){Release} }
     }
-    if($on -and $Hold -eq 0 -and $sw.ElapsedMilliseconds -ge $next){ Fire; $n++; $next=$sw.ElapsedMilliseconds+$Ms }
-    Start-Sleep -Milliseconds 20
+    if($on -and $Hold -eq 0 -and $now -ge $next){
+      Fire; $n++; $next += $Ms
+    }
+    [System.Threading.Thread]::Sleep($pollMs)
   }
 } finally {
   if($on -and $Hold -eq 1){ Release }
+  [M.U]::timeEndPeriod(1) | Out-Null
   Write-Host "($n action(s) sent)"
 }
 PSEOF
@@ -457,9 +530,29 @@ run_shell_loop() {
     case $BACKEND in xdotool) x_check ;; macos) mac_check ;; esac
     caps_setup
 
-    # tick = poll period; never coarser than the interval itself
-    TICK=$(awk -v i="$INTERVAL" -v t="$TICK" 'BEGIN{ if (i < t) t = i; printf "%.3f", t }')
-    TICKS=$(awk -v i="$INTERVAL" -v t="$TICK" 'BEGIN{ n = int(i / t + 0.5); if (n < 1) n = 1; print n }')
+    # Guard against ancient sleep(1) that only supports whole seconds.
+    if [ "$TICK" = 1 ] && awk -v i="$INTERVAL" 'BEGIN{exit !(i < 1)}'; then
+        die "interval < 1s not supported here (system 'sleep' only accepts whole seconds)"
+    fi
+
+    POLL=$TICK
+
+    # Firing strategy:
+    #   hold - press once, release on pause
+    #   fast - interval < poll period: fire a *batch* per poll via the backend's
+    #          own repeat (xdotool --repeat, JXA loop) so real rate = 1/interval
+    #   slow - interval >= poll period: fire one action every TICKS polls
+    if [ "$HOLD" = 1 ]; then
+        STRATEGY=hold
+    elif awk -v i="$INTERVAL" -v p="$POLL" 'BEGIN{exit !(i < p)}'; then
+        STRATEGY=fast
+        BATCH=$(awk -v i="$INTERVAL" -v p="$POLL" 'BEGIN{ n=int(p/i+0.5); if(n<1)n=1; print n }')
+        DELAY_MS=$(awk -v i="$INTERVAL" 'BEGIN{ d=int(i*1000+0.5); if(d<1)d=1; print d }')
+        SLEEP_AFTER=$INTERVAL
+    else
+        STRATEGY=slow
+        TICKS=$(awk -v i="$INTERVAL" -v p="$POLL" 'BEGIN{ n=int(i/p+0.5); if(n<1)n=1; print n }')
+    fi
 
     caps_poll; prev=$CAPS
     if [ "$prev" = 1 ]; then
@@ -476,20 +569,33 @@ run_shell_loop() {
             if [ "$CAPS" = 1 ]; then
                 running=1; count=0
                 printf '%s  %s RUNNING\n' "$(stamp)" "$ICON_RUN"
-                do_action
+                if [ "$HOLD" = 1 ]; then
+                    do_action
+                elif [ "$STRATEGY" = fast ]; then
+                    do_action_batch "$BATCH" "$DELAY_MS"
+                else
+                    do_action
+                fi
             else
                 running=0
                 printf '%s  %s PAUSED\n' "$(stamp)" "$ICON_PAUSE"
                 release_action
             fi
-        fi
-        if [ "$running" = 1 ] && [ $HOLD = 0 ]; then
-            count=$((count + 1))
-            if [ "$count" -ge "$TICKS" ]; then
-                do_action; count=0
+        elif [ "$running" = 1 ] && [ "$HOLD" = 0 ]; then
+            if [ "$STRATEGY" = fast ]; then
+                do_action_batch "$BATCH" "$DELAY_MS"
+            else
+                count=$((count + 1))
+                if [ "$count" -ge "$TICKS" ]; then
+                    do_action; count=0
+                fi
             fi
         fi
-        sleep "$TICK"
+        # Fast mode already spent ~POLL in the batch; slow/hold need a full poll.
+        case $STRATEGY in
+            fast) sleep "$SLEEP_AFTER" ;;
+            *)    sleep "$POLL" ;;
+        esac
     done
 }
 

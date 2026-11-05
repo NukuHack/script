@@ -430,71 +430,146 @@ def scan_actions(text):
         res.append((m.group(1), ""))
     return res
 
-def scan_page(page_url, say=None):
-    """fetch a page + its scripts, return [(id, name)] of all server actions"""
-    u, code, html = http(page_url)
-    cand = re.findall(r'(?:src|href)="([^"]+\.js[^"]*)"', html)
-    cand += ["/_next/" + m for m in re.findall(r'static/chunks/[^"\\\s]+?\.js', html)]
-    urls, seen_u = [], set()
-    for s in cand:
-        a = urljoin(u, s.replace("\\u0026", "&"))
-        key = a.split("?")[0]
-        if urlparse(a).netloc == urlparse(BASE).netloc and key not in seen_u:
-            seen_u.add(key)
-            urls.append(a)
-    found, seen = [], set()
-    def add(items):
-        for aid, name in items:
-            if aid not in seen:
-                seen.add(aid)
-                found.append((aid, name))
-    add(scan_actions(html))
-    for a in urls[:80]:
-        _, c, js = http(a)
-        if c == 200:
-            add(scan_actions(js))
-    return found
+def scan_page(page_url, anon=False, want=None):
+    """fetch a page + its scripts. returns ([(id, name)], [ids found in chunks that mention `want`]).
+    anon=True scans without cookies, so a still-valid session cannot redirect /login away."""
+    saved = dict(cookies)
+    if anon:
+        cookies.clear()
+    try:
+        u, code, html = http(page_url)
+        cand = re.findall(r'(?:src|href)="([^"]+\.js[^"]*)"', html)
+        cand += ["/_next/" + m for m in re.findall(r'static/chunks/[^"\\\s]+?\.js', html)]
+        urls, seen_u = [], set()
+        for s_ in cand:
+            a_ = urljoin(u, s_.replace("\\u0026", "&"))
+            key = a_.split("?")[0]
+            if urlparse(a_).netloc == urlparse(BASE).netloc and key not in seen_u:
+                seen_u.add(key)
+                urls.append(a_)
+        found, seen, hinted = [], set(), []
+        def add(items, hint=False):
+            for aid, name in items:
+                if aid not in seen:
+                    seen.add(aid)
+                    found.append((aid, name))
+                if hint and aid not in hinted:
+                    hinted.append(aid)
+        add(scan_actions(html), want is not None and want in html)
+        for a_ in urls[:120]:
+            _, c, js = http(a_)
+            if c == 200:
+                add(scan_actions(js), want is not None and want in js)
+        return found, hinted
+    finally:
+        if anon:
+            cookies.clear()
+            cookies.update(saved)
+            save_state()
 
 # ------------------------------------------------------------ login
 def discover_action():
-    cands = scan_page(LOGIN)
-    for aid, name in cands:
+    """find the login server-action id in the login page's scripts (without cookies)"""
+    found, hinted = scan_page(LOGIN, anon=True, want="authId")
+    for aid, name in found:
         if re.search(r'login|signin|sign_in|authenticate', name, re.I):
             return aid
-    return cands[0][0] if len(cands) == 1 else ""
+    if len(hinted) == 1:                      # the only action in a chunk that handles "authId"
+        return hinted[0]
+    if len(found) == 1:
+        return found[0][0]
+    return ""
+
+def extract_action(text):
+    m = re.search(r'(?i)next-action["\'\s:=]+([0-9a-f]{40,64})', text) or re.search(r'\b([0-9a-f]{40,64})\b', text)
+    return m.group(1).lower() if m else ""
+
+def get_login_action(force=False):
+    """cached -> auto-detected -> asked once (validated). returns '' if the user gives up."""
+    if not force:
+        env = os.environ.get("PROGENV_ACTION", "")
+        a = extract_action(env) if env else ""
+        if a:
+            return a
+        if state.get("action"):
+            return state["action"]
+    print(" (looking for the login action id in the site's scripts...)")
+    try:
+        a = discover_action()
+    except Exception as e:
+        print(" scan failed:", e)
+        a = ""
+    if not a:
+        print("\n Could not find the login action id automatically (one-time setup).")
+        print(" In Firefox: F12 > Network > log in once > click the 'login' POST > Headers >")
+        print(" Request Headers > copy the value of 'Next-Action'.")
+        print(" (pasting the whole 'Copy as cURL' also works)")
+        while not a:
+            try:
+                v = input_(" Next-Action (Enter = cancel): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return ""
+            if not v:
+                return ""
+            a = extract_action(v)
+            if not a:
+                print(" that does not look like an action id (40+ hex characters like 7f3a9c...)")
+    state["action"] = a
+    save_state()
+    return a
+
+def norm_authid(s):
+    s = s.strip()
+    return s.upper() if re.match(r"^[A-Za-z0-9]{6}$", s) else s      # neptun codes are upper case
+
+def server_says(body):
+    m = re.findall(r'"(?:message|error|errors?|detail)"\s*:\s*"([^"]{1,200})"', body)
+    if m:
+        return m[0]
+    txt = re.sub(r"\s+", " ", re.sub(r"[\x00-\x1f\x7f]", " ", body)).strip()
+    return txt[:160]
 
 def do_login():
     """asks for credentials like a browser login form. returns True on success."""
+    action = get_login_action()
+    if not action:
+        return False
     for attempt in range(3):
         d = state.get("authId", "")
-        aid = input_("Name (authId)%s: " % (" [%s]" % d if d else "")).strip() or d
+        aid = norm_authid(input_("Name (authId)%s: " % (" [%s]" % d if d else "")).strip() or d)
         pw = getpass.getpass("Password: ")
         if not aid or not pw:
             print("both are required")
             continue
-        action = state.get("action") or discover_action()
-        if not action:
-            print("(could not auto-detect the login action id)")
-            action = input_("Next-Action header value (dev tools, login request) or empty to try without: ").strip()
-        hdr = {"Content-Type": "text/plain;charset=UTF-8",
-               "Accept": "text/x-component",
-               "Origin": BASE, "Referer": LOGIN}
-        if action:
-            hdr["Next-Action"] = action
-        old = cookies.get("access_token")
-        cookies.pop("access_token", None)
-        cookies.pop("refresh_token", None)
-        _, code, body = http(LOGIN, data=json.dumps([{"authId": aid, "password": pw}]), headers=hdr)
-        if cookies.get("access_token"):
-            state["authId"], state["action"] = aid, action
-            save_state()
-            print("login ok")
-            return True
-        if old:
-            cookies["access_token"] = old
-        print("login failed (HTTP %s). wrong password, or the action id is stale." % code)
-        state["action"] = ""
-        save_state()
+        for tryno in (0, 1):
+            hdr = {"Content-Type": "text/plain;charset=UTF-8", "Accept": "text/x-component",
+                   "Origin": BASE, "Referer": LOGIN, "Next-Action": action}
+            old = {k: cookies.get(k) for k in ("access_token", "refresh_token")}
+            cookies.pop("access_token", None)
+            cookies.pop("refresh_token", None)
+            _, code, body = http(LOGIN, data=json.dumps([{"authId": aid, "password": pw}]), headers=hdr)
+            if cookies.get("access_token"):
+                state["authId"], state["action"] = aid, action
+                save_state()
+                print("login ok")
+                return True
+            for k, v in old.items():
+                if v:
+                    cookies[k] = v
+            if (code == 404 or "Server action not found" in body[:300]) and tryno == 0:
+                print("the saved login action id is no longer valid (the site was updated).")
+                state["action"] = ""
+                save_state()
+                action = get_login_action(force=True)
+                if not action:
+                    return False
+                continue                      # retry right away with the same name/password
+            break
+        print("login rejected (HTTP %s): check name and password. the action id is kept." % code)
+        msg = server_says(body)
+        if msg:
+            print("server says: " + msg)
     return False
 
 def logged_in_page(url, html):
@@ -816,7 +891,7 @@ def get_action(role, page_url, force=False):
         return ""
     if force or not state["found"]:
         print(" (scanning the site's scripts for server actions, one time...)")
-        state["found"] = [list(x) for x in scan_page(page_url)]
+        state["found"] = [list(x) for x in scan_page(page_url)[0]]
         save_state()
     assign_roles([tuple(x) for x in state["found"]], force=force)
     if state["roles"].get(role):
@@ -1487,6 +1562,20 @@ def main():
     global cookies
     load_state()
     cookies = state["cookies"]
+    args = sys.argv[1:]
+    if args[:1] == ["--action"] and len(args) > 1:
+        a = extract_action(" ".join(args[1:]))
+        if not a:
+            print("that does not look like an action id (40+ hex characters)")
+            return
+        state["action"] = a
+        save_state()
+        print("login action id saved")
+    elif args[:1] == ["--forget-action"]:
+        state["action"] = ""
+        save_state()
+        print("login action id forgotten (it will be detected again)")
+        return
     S = {"cur": None, "hist": []}
 
     def navigate(url, push=True):
@@ -1500,6 +1589,8 @@ def main():
 
     try:
         navigate(START)
+    except KeyboardInterrupt:
+        print("\n(cancelled)")
     except Exception as e:
         print("error:", e)
     while True:

@@ -264,12 +264,25 @@ def norm_authid(s):
     s = s.strip()
     return s.upper() if re.match(r"^[A-Za-z0-9]{6}$", s) else s      # neptun codes are upper case
 
-def server_says(body):
+def clean_err(body, n=200):
+    """short, readable version of an error response (HTML pages / stack traces / JSON / plain text)"""
+    body = body or ""
     m = re.findall(r'"(?:message|error|errors?|detail)"\s*:\s*"([^"]{1,200})"', body)
     if m:
         return m[0]
+    if re.search(r"(?i)<(!doctype|html|head|body)\b", body):
+        t = re.search(r"(?is)<title[^>]*>(.*?)</title>", body) or re.search(r"(?is)<h1[^>]*>(.*?)</h1>", body)
+        txt = re.sub(r"<[^>]+>", " ", t.group(1)) if t else re.sub(r"(?is)<(script|style).*?</\1>|<[^>]+>", " ", body)
+        txt = re.sub(r"\s+", " ", txt).strip()
+        return "(error page) " + fit(txt, n) if txt else "(error page)"
+    st = re.search(r"(?m)^(.{1,%d}?)\s*(?:\n\s*at |\n\s*Stack trace|\n#0 )" % n, body)
+    if st:
+        return fit(st.group(1).strip(), n) + "  (stack trace hidden)"
     txt = re.sub(r"\s+", " ", re.sub(r"[\x00-\x1f\x7f]", " ", body)).strip()
-    return txt[:160]
+    return fit(txt, n)
+
+def server_says(body):
+    return clean_err(body, 160)
 
 def do_login():
     """asks for credentials like a browser login form. returns True on success."""
@@ -525,9 +538,9 @@ def fetch_subs(page_url, task, opts=None):
         return None, str(e)
     data, err = flight_data(text)
     if code != 200 or err:
-        return None, "HTTP %s %s" % (code, err or text[:200])
+        return None, "HTTP %s %s" % (code, err or clean_err(text))
     if not isinstance(data, list):
-        return None, "unexpected response: " + text[:200]
+        return None, "unexpected response: " + clean_err(text)
     return data, None
 
 # ------------------------------------------------------------ submission rendering
@@ -860,6 +873,8 @@ def watch(page_url, task, target_no, label):
 
 # ------------------------------------------------------------ commands
 EXT_LANG = {".cs": "cs", ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp", ".pas": "pas", ".pp": "pas"}
+# Content-Type the browser sends for the uploaded file (pinned so it does not depend on the system's mime.types)
+EXT_MIME = {".cpp": "text/x-c++src", ".cc": "text/x-c++src", ".cxx": "text/x-c++src"}
 EXT_LABEL = {".cs": "c#", ".cpp": "c++", ".cc": "c++", ".cxx": "c++", ".pas": "pascal", ".pp": "pascal"}
 
 def pick_language(cur, fname):
@@ -887,7 +902,7 @@ def pick_language(cur, fname):
                 if a.lower() in (v.lower(), l.lower()):
                     return v
             print(" not one of the options")
-    a = input_(" Language value [%s] (known: cs = C#): " % default).strip() or default
+    a = input_(" Language value [%s] (known: cs = C#, cpp = C++, pas = Pascal): " % default).strip() or default
     return a
 
 
@@ -932,7 +947,7 @@ def cmd_upload(cur, arg):
     before_max = max([s.get("submissionNo") or 0 for s in before]) if before else 0
     body, ctype = multipart([
         ("field", "1_language", lang),
-        ("file", "1_file", fname, mimetypes.guess_type(fname)[0] or "text/plain", content),
+        ("file", "1_file", fname, EXT_MIME.get(os.path.splitext(fname)[1].lower()) or mimetypes.guess_type(fname)[0] or "text/plain", content),
         ("field", "1_mode", mode),
         ("field", "0", json.dumps(["$K1", task + "/submissions"])),
     ])
@@ -943,7 +958,7 @@ def cmd_upload(cur, arg):
         return
     data, err = flight_data(text)
     if code != 200 or (err and err != "unrecognized response"):
-        print(" upload failed (HTTP %s): %s" % (code, fit("%s" % (err or text), 300)))
+        print(" upload failed (HTTP %s): %s" % (code, fit("%s" % (err if err and err != "unrecognized response" else clean_err(text, 300)), 300)))
         return
     print(" uploaded.")
     target = None
@@ -1009,7 +1024,7 @@ def cmd_code(cur, arg):
         return
     data, err = flight_data(text)
     if not isinstance(data, dict):
-        print(" error: %s" % fit("%s" % (err or text), 300))
+        print(" error: %s" % (err if err and err != "unrecognized response" else clean_err(text, 300)))
         return
     if data.get("kind") == "single-file" and isinstance(data.get("content"), string_types):
         fname, src = data.get("fileName") or "code.txt", data["content"]
@@ -1082,27 +1097,49 @@ def cmd_actions(arg):
 
 # ------------------------------------------------------------ screen
 HINT = " <n> open link   g <path>   b back   r reload   / search   ? help   q quit"
-HINT_TASK = " up = upload file   subs = submissions   sub <n> = details   code <n> = source   opts   actions"
+HINT_TASK = [" up = upload   subs = submissions   sub <n> = details   code <n> = source",
+             " opts = options   actions = server-action ids"]
 
 def draw(p):
     head = " %s  [%s]" % (p.url, p.code)
     if p.user:
         head += "   user: " + p.user
-    hints = [HINT] + ([HINT_TASK] if parse_task(p.url) else [])
+    hints = [HINT] + (HINT_TASK if parse_task(p.url) else [])
     show_screen([head], [p.body], hints, menu=p.menu)
 
 
-HELP = """ <number>      follow link [number]  (files like PDF / zip are downloaded to ~/progenv-downloads)
- g <path|url>  go to e.g. /hu/courses (same host only)
- b back   r reload   / <text> search in page   raw  show html
- relogin       log in again      logout  forget session      q quit
- on a task page:
-   up [file]     upload a solution (asks language, confirms, then shows the live run)
-   subs          list your submissions        subs opts   same, sending the options (see opts)
-   sub [n]       full result of submission n (default: latest)
-   code <n> [save]   show the source of submission n (save = write it to the current dir)
-   opts          edit the option list      actions   show / set the server-action ids
- (long pages: Enter = next screen, a = show all, q = stop)""".split("\n")
+HELP = [
+    "### Navigation",
+    "  <number>                  follow that link (files go to ~/progenv-downloads)",
+    "  g <path|url>              go to a page, e.g. g /hu/courses (same host)",
+    "  b                         back",
+    "  r                         reload this page",
+    "  / <text>                  search in the page",
+    "  raw                       show the page's HTML",
+    "  q                         quit",
+    "",
+    "### Session",
+    "  relogin                   log in again",
+    "  logout                    forget the saved session",
+    "",
+    "### On a task page",
+    "  up [file]                 upload a solution (asks first, then watches)",
+    "  subs                      list your submissions",
+    "  subs opts                 same, sending the options (see opts)",
+    "  sub [n]                   full result of submission n (default: latest)",
+    "  code <n> [save]           show source of submission n (save = write to ./)",
+    "",
+    "### Settings",
+    "  opts                      edit the option list sent by  subs opts",
+    "  actions                   show the server-action ids",
+    "  actions bind <role> <id>  set by hand (roles: submit, list, code)",
+    "  actions rescan            forget them and scan the site again",
+    "",
+    "### Long pages",
+    "  Enter                     next screen",
+    "  a                         show everything",
+    "  q                         stop paging",
+]
 
 def main():
     global cookies

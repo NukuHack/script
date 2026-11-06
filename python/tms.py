@@ -75,6 +75,10 @@ class ApiError(Exception):
     pass
 
 def err_text(code, text):
+    # PHP/Yii debug pages: show only the message, the full trace stays in the log file
+    m = re.search(r"with message '([^']*)'", text)
+    if m and "Stack trace" in text:
+        return "HTTP %s: server error (%s)  [full trace in %s]" % (code, fit(m.group(1), 120), LOG_FILE)
     try:
         o = json.loads(text)
         if isinstance(o, dict):
@@ -409,7 +413,9 @@ def scr_task(tid):
     if flags:
         s.add("Info: " + ", ".join(flags))
     if t.get("entryPasswordProtected"):
-        s.add("      entry password required: type  pw  (see  pwcfg  if not configured yet)")
+        s.add("      entry password: " + ("UNLOCKED" if t.get("entryPasswordUnlocked") else "LOCKED - type  pw  to unlock"))
+    if t.get("isIpAddressAllowed") is False:
+        s.add("      WARNING this IP address is not allowed for this task (the web UI blocks unlock/upload here)")
     s.add("", "### My submission")
     if sub:
         s.ctx["subid"] = sub.get("id")
@@ -554,8 +560,11 @@ def cmd_upload(cur, arg):
 #     pwcfg POST /student/tasks/{id}/<what-you-saw> {"password":"{pw}"}
 # {id} = task id, {pw} = the password (JSON-escaped). It is saved in ~/.tms_client.json
 # (without any password). Env var TMS_PW_REQ overrides it.
+# found in the web app's own JS:  POST /student/tasks/{id}/unlock  {"password": ...}
+DEFAULT_PW_REQ = 'POST /student/tasks/{id}/unlock {"password":"{pw}"}'
+
 def pw_spec():
-    return os.environ.get("TMS_PW_REQ") or CFG.get("pw_req") or ""
+    return os.environ.get("TMS_PW_REQ") or CFG.get("pw_req") or DEFAULT_PW_REQ
 
 def parse_spec(spec):
     toks = spec.split(None, 2)
@@ -565,7 +574,7 @@ def parse_spec(spec):
 
 def cmd_pwcfg(arg):
     if not arg.strip():
-        print(" current: %s" % (pw_spec() or "(not set)"))
+        print(" current: %s%s" % (pw_spec(), "" if CFG.get("pw_req") else "   (built-in default)"))
         print(" usage:   pwcfg POST /student/tasks/{id}/<path> {\"password\":\"{pw}\"}")
         print("          (copy method/path/body from the browser's Network tab; {id} and {pw} are filled in)")
         return
@@ -588,16 +597,31 @@ def cmd_pw(cur, arg):
         return
     spec = parse_spec(pw_spec())
     if not spec:
-        print(" the password request is not configured yet. Run  pwcfg  for how.")
+        print(" bad password request config. Run  pwcfg clear  to use the built-in default.")
         return
+    if t.get("entryPasswordUnlocked"):
+        print(" already unlocked")
+        return
+    if t.get("entryPasswordProtected") is False:
+        print(" this task has no entry password")
+        return
+    if t.get("isIpAddressAllowed") is False:
+        print(" WARNING the server reports this IP as not allowed for the task; the web UI would not offer unlock here.")
+        if not yes(" Try anyway? [y/N] "):
+            return
     method, path, body = spec
     pw = arg if arg else getpass.getpass(" Entry password: ")
     if not pw:
         return
     path = path.replace("{id}", "%s" % t.get("id"))
+    shown = None
     if body:
-        body = body.replace("{id}", "%s" % t.get("id")).replace("{pw}", json.dumps(pw)[1:-1])
-    print(" %s %s%s" % (method, path, "   body: " + re.sub(r"(?s)" + re.escape(json.dumps(pw)[1:-1]), "***", body) if body else ""))
+        body = body.replace("{id}", "%s" % t.get("id"))
+        shown = body.replace("{pw}", "***")
+        body = body.replace("{pw}", json.dumps(pw)[1:-1])
+        if "{pw}" not in pw_spec():
+            print(" WARNING the saved request has no {pw} placeholder (a literal password is stored in the config?)")
+    print(" %s %s%s" % (method, path, ("   body: " + shown) if shown else ""))
     code, r = api_request(method, path, body)
     text = r.read().decode("utf-8", "replace")
     log("pw %s %s -> %s %s" % (method, path, code, text[:2000].replace("\n", "\\n")))
@@ -607,6 +631,59 @@ def cmd_pw(cur, arg):
     print(" accepted (HTTP %s)%s" % (code, (": " + fit(text.strip(), 150)) if text.strip() else ""))
     S["me"] = None
     go(S["cur"][1], S["cur"][2], push=False)
+
+def cmd_hunt(arg):
+    """headless replacement for browser DevTools: crawl the site's JS bundles (including lazy
+    chunks) and print code that mentions the entry/exit password or the task API paths.
+    hunt            -> default: entryPassword / exitPassword / unlock + /student/tasks calls
+    hunt <regex>    -> your own case-insensitive regex"""
+    site = os.environ.get("TMS_SITE") or re.sub(r"/api$", "", BASE) + "/"
+    pat_s = arg.strip() or r"entry.?password|exit.?password|password.?unlock|unlock.?password|/unlock|/enter|student/tasks"
+    try:
+        pat = re.compile(r"[^\n]{0,110}(?:%s)[^\n]{0,160}" % pat_s, re.I)
+    except re.error as e:
+        print(" bad regex: %s" % e)
+        return
+    def get(u):
+        rq = ur.Request(u)
+        rq.add_header("User-Agent", UA)
+        return ur.urlopen(rq, timeout=60).read().decode("utf-8", "replace")
+    try:
+        html = get(site)
+    except Exception as e:
+        print(" cannot fetch %s: %s" % (site, e))
+        return
+    todo = [urljoin(site, x) for x in re.findall(r'(?:src|href)=["\']([^"\']+\.js[^"\']*)["\']', html)]
+    seen, shown = set(), 0
+    print(" crawling %s ..." % site)
+    while todo and len(seen) < 150:
+        src = todo.pop(0)
+        if src in seen:
+            continue
+        seen.add(src)
+        try:
+            js = get(src)
+        except Exception as e:
+            print(" skip %s (%s)" % (src.rsplit("/", 1)[-1], e))
+            continue
+        # lazy chunks: import("./X.js"), "assets/X.js", "X.js" (resolved against this file)
+        for ch in re.findall(r'["\'`]((?:\.{0,2}/)?[\w./-]+\.js)["\'`]', js):
+            u = urljoin(src, ch)
+            if u.startswith(site) and u not in seen and u not in todo:
+                todo.append(u)
+        hits = []
+        for m in pat.finditer(js):
+            h = m.group(0).strip()
+            if h not in hits:
+                hits.append(h)
+        if hits:
+            print("\n== %s  (%d hit%s)" % (src.rsplit("/", 1)[-1], len(hits), "" if len(hits) == 1 else "s"))
+            for h in hits[:25]:
+                print("   " + h)
+                shown += 1
+    print("\n %d file(s) scanned, %d hit(s) shown." % (len(seen), shown))
+    print(" Look for a call like  .post(`/student/tasks/${id}/...`,{...})  near entryPassword.")
+    print(" Narrow down with e.g.  hunt entryPassword   or   hunt unlock")
 
 def watch(t, subid):
     cols = term_size()[0]
@@ -659,17 +736,46 @@ HINTS = {
     "sub": " at = auto-test results   get = download   report",
 }
 
-HELP = """ <number>      open the item with that number (files/submissions are downloaded to ~/tms-downloads)
- b back   r reload   h home   / <text> search in screen   raw  raw JSON of this screen
- sem           choose semester          subs   all my submissions
- notif         notifications            att    attendance (this semester)
- quiz          quiz instances (read-only; pick one for its results)         me   your settings
- on a task:    up [file]  upload (asks first, then watches auto-test)    at  auto-test results
-               get  download my submission     report  download my report
-               pw [password]  enter the task's entry password   pwcfg  set up that request
- api [METHOD] <path> [json]   any API call (anything but GET asks first)
- token         check the cached token         relogin   logout   q quit
- (long screens: Enter = next screen, a = show all, q = stop)""".split("\n")
+HELP = [
+    "### Navigation",
+    "  <number>                    open that item (downloads go to ~/tms-downloads)",
+    "  b                           back",
+    "  r                           reload this screen",
+    "  h  /  home                  home screen (your groups)",
+    "  / <text>                    search the current screen",
+    "  raw                         raw JSON of the current screen",
+    "  q                           quit",
+    "",
+    "### Browse",
+    "  sem                         choose semester",
+    "  subs                        all my submissions",
+    "  notif                       notifications",
+    "  att                         attendance (this semester)",
+    "  quiz                        quiz instances (read-only; pick one for results)",
+    "  me                          your settings",
+    "",
+    "### On a task or submission",
+    "  up [file]                   upload (asks first, then watches the auto-test)",
+    "  at                          auto-tester results",
+    "  get                         download my submission",
+    "  report                      download my report",
+    "",
+    "### Entry password",
+    "  pw [password]               unlock the task (prompts if no password given)",
+    "  pwcfg [spec]                show/change the unlock request (clear = reset)",
+    "  hunt [regex]                scan the site's JS for API paths",
+    "",
+    "### Advanced",
+    "  api [METHOD] <path> [json]  any API call (non-GET asks first)",
+    "  token                       check the cached token",
+    "  relogin                     log in again",
+    "  logout                      remove the cached token",
+    "",
+    "### Long screens",
+    "  Enter                       next screen",
+    "  a                           show everything",
+    "  q                           stop paging",
+]
 
 def draw(sc):
     me = S["me"] or {}
@@ -818,6 +924,8 @@ def main():
                 except OSError:
                     pass
                 print("token removed")
+            elif verb == "hunt":
+                cmd_hunt(arg)
             elif verb == "pwcfg":
                 cmd_pwcfg(arg)
             elif verb in ("pw", "password"):

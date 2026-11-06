@@ -72,7 +72,7 @@ alias la='ls -A'
 
 alias gp='git pull'
 alias gst='git status'
-alias gpf='git reset --hard HEAD && git pull'
+alias gpf='git fetch origin && git reset --hard @{u}'
 alias ga='git add'
 alias gps='git push'
 alias gf='git fetch'

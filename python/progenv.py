@@ -11,25 +11,12 @@ try:
 except ImportError:
     readline = None
 
-try:                                   # py2
-    import urllib2 as ur
-    from urlparse import urljoin, urlparse
-    from urllib import unquote
-    from HTMLParser import HTMLParser
-    from htmlentitydefs import name2codepoint
-    import Queue as queue
-    input_ = raw_input
-    unichr_ = unichr
-    string_types = basestring
-except ImportError:                    # py3
-    import urllib.request as ur
-    from urllib.parse import urljoin, urlparse, unquote
-    from html.parser import HTMLParser
-    from html.entities import name2codepoint
-    import queue
-    input_ = input
-    unichr_ = chr
-    string_types = str
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+try:
+    from elteui import *               # shared rendering / download / terminal helpers
+except ImportError:
+    sys.stderr.write("elteui.py must be in the same folder as this script\n")
+    sys.exit(1)
 
 BASE = os.environ.get("PROGENV_BASE", "https://progenv.inf.elte.hu").rstrip("/")
 START = BASE + "/hu/"
@@ -50,124 +37,9 @@ state = {"cookies": {}, "authId": "", "action": "", "roles": {}, "names": {},
 cookies = None
 NOASK = set()                           # roles the user declined to provide this session
 
-def B(s):
-    return s if isinstance(s, bytes) else s.encode("utf-8")
 
 # ------------------------------------------------------------ terminal
-COLOR = sys.stdout.isatty() and os.environ.get("TERM", "dumb") != "dumb"
 
-def term_size():
-    try:
-        import shutil
-        s = shutil.get_terminal_size((80, 24))
-        return s.columns, s.lines
-    except Exception:
-        pass
-    try:
-        r, c = os.popen("stty size 2>/dev/null").read().split()
-        return int(c), int(r)
-    except Exception:
-        pass
-    try:
-        return int(os.environ.get("COLUMNS", 80)), int(os.environ.get("LINES", 24))
-    except Exception:
-        return 80, 24
-
-def w(s):
-    """write text safely, whatever the terminal encoding is"""
-    if not isinstance(s, bytes):
-        enc = getattr(sys.stdout, "encoding", None) or "utf-8"
-        s = s.encode(enc, "replace")
-    out = getattr(sys.stdout, "buffer", sys.stdout)
-    out.write(s)
-    out.flush()
-
-def col(code, s):
-    return "\033[%sm%s\033[0m" % (code, s) if COLOR else s
-
-WORD_RE = re.compile(r"\b(SUCCESS|PASS|OK|FAILED|FAILURE|ERROR|WRONG|CRASH|TIMEOUT|SIGNAL|PART|"
-                     r"WARNING|RUNNING|PENDING|QUEUED|COMPILING|EVALUATING)\b")
-WORD_COL = {"SUCCESS": "1;32", "PASS": "1;32", "OK": "32",
-            "FAILED": "1;31", "FAILURE": "1;31", "ERROR": "1;31", "WRONG": "1;31",
-            "CRASH": "1;31", "TIMEOUT": "1;31", "SIGNAL": "31",
-            "PART": "1;33", "WARNING": "33",
-            "RUNNING": "1;36", "PENDING": "36", "QUEUED": "36",
-            "COMPILING": "36", "EVALUATING": "36"}
-
-def colorize(line):
-    if re.match(r"^#{1,3} ", line):
-        return col("1;33", line)
-    line = re.sub(r"\[(\d+)\]", lambda m: col("1;36", m.group(0)), line)
-    return WORD_RE.sub(lambda m: col(WORD_COL[m.group(1)], m.group(1)), line)
-
-def clear_screen():
-    if COLOR:
-        w("\033[H\033[2J\033[3J")
-
-def erase_prev_line():
-    if COLOR:
-        w("\033[1A\033[2K\r")
-
-def wrap(text, width):
-    out = []
-    for ln in text.split("\n"):
-        if len(ln) <= width:
-            out.append(ln)
-            continue
-        s = ln.lstrip()
-        sub = " " * (len(ln) - len(s) + (2 if s.startswith("* ") else 0))
-        out.extend(textwrap.wrap(ln, width, subsequent_indent=sub) or [""])
-    return out
-
-def fit(s, width):
-    return s if len(s) <= width else s[:max(0, width - 3)] + "..."
-
-def paged(lines, rows, color=True):
-    """print lines; if taller than the screen, stop after each screenful"""
-    f = colorize if color else (lambda s: s)
-    step = max(5, rows - 2)
-    n, i = len(lines), 0
-    while i < n:
-        w("\n".join(f(l) for l in lines[i:i + step]) + "\n")
-        i += step
-        if i < n and sys.stdout.isatty():
-            try:
-                a = input_("-- %d%%  Enter: more | a: all | q: stop -- " % (100 * i // n)).strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                w("\n")
-                break
-            erase_prev_line()
-            if a == "q":
-                break
-            if a == "a":
-                w("\n".join(f(l) for l in lines[i:]) + "\n")
-                break
-
-def hsize(n):
-    n = float(n)
-    for u in ("B", "KB", "MB", "GB"):
-        if n < 1024 or u == "GB":
-            return ("%d %s" % (n, u)) if u == "B" else ("%.1f %s" % (n, u))
-        n /= 1024.0
-
-def ask_path(prompt):
-    """input() with tab-completion of file names"""
-    if not readline:
-        return input_(prompt).strip()
-    import glob
-    def comp(text, i):
-        m = [x + ("/" if os.path.isdir(x) else "")
-             for x in glob.glob(os.path.expanduser(text) + "*")]
-        return m[i] if i < len(m) else None
-    old, olddel = readline.get_completer(), readline.get_completer_delims()
-    readline.set_completer(comp)
-    readline.set_completer_delims(" \t\n")
-    readline.parse_and_bind("tab: complete")
-    try:
-        return input_(prompt).strip()
-    finally:
-        readline.set_completer(old)
-        readline.set_completer_delims(olddel)
 
 # ------------------------------------------------------------ state file
 def load_state():
@@ -259,144 +131,13 @@ def http(url, data=None, headers=None):
         return u, 0, ""
     return u, code, r.read().decode("utf-8", "replace")
 
-def hdr_get(r, name, default=""):
-    try:
-        return r.info().get(name, default) or default
-    except Exception:
-        return default
 
 # ------------------------------------------------------------ html -> text
-SKIP = set(["script", "style", "head", "svg", "noscript", "template"])
-PARA = set("p h1 h2 h3 h4 h5 h6 ul ol table".split())
-LINE = set("li tr br div section article header footer main nav form dl dt dd aside pre".split())
-INLINE = set("span button label small strong b em i code time td th option".split())
 
-class T(HTMLParser):
-    def __init__(self, base):
-        HTMLParser.__init__(self)
-        self.base, self.out, self.tail = base, [], ""
-        self.links, self.astack = [], []
-        self.skip = self.inlink = 0
-        self.has_password = False
-        self.selects, self.hidden, self._opt = [], {}, None
-
-    def put(self, s):
-        if s:
-            self.out.append(s)
-            self.tail = (self.tail + s)[-3:]
-
-    def ensure(self, n):
-        if not self.out:
-            return
-        have = len(self.tail) - len(self.tail.rstrip("\n"))
-        if have < n:
-            self.put("\n" * (n - have))
-
-    def spacer(self):
-        if self.tail and self.tail[-1] not in " \n":
-            self.put(" ")
-
-    def handle_starttag(self, tag, attrs):
-        a = dict(attrs)
-        if tag == "input" and a.get("type") == "password":
-            self.has_password = True
-        if tag in SKIP:
-            self.skip += 1
-            return
-        if self.skip:
-            return
-        if tag == "select":
-            self.selects.append({"name": a.get("name") or "", "options": []})
-        elif tag == "option" and self.selects:
-            self._opt = [a.get("value"), ""]
-        elif tag == "input" and a.get("type") == "hidden" and a.get("name") \
-                and not a["name"].startswith("$"):
-            self.hidden[a["name"]] = a.get("value") or ""
-        if tag == "a":
-            h = a.get("href") or ""
-            ok = False
-            if h and not h.startswith(("#", "javascript", "mailto")):
-                url = urljoin(self.base, h)
-                if urlparse(url).netloc == urlparse(BASE).netloc:
-                    self.links.append(url)
-                    self.spacer()
-                    self.put("[%d] " % len(self.links))
-                    self.inlink += 1
-                    ok = True
-            self.astack.append(ok)
-            return
-        if self.inlink:
-            self.spacer()
-            return
-        if tag in PARA:
-            self.ensure(2)
-        elif tag in LINE:
-            self.ensure(1)
-        elif tag in INLINE:
-            self.spacer()
-        if tag in ("h1", "h2", "h3"):
-            self.put("#" * int(tag[1]) + " ")
-        elif tag == "li":
-            self.put("  * ")
-        elif tag in ("td", "th"):
-            self.put("| ")
-        elif tag == "input" and a.get("type") not in ("hidden", "password", "checkbox", "radio"):
-            self.put("[input %s=%s] " % (a.get("name", ""), a.get("value", "")))
-
-    def handle_endtag(self, tag):
-        if tag in SKIP:
-            self.skip = max(0, self.skip - 1)
-            return
-        if self.skip:
-            return
-        if tag == "option" and self._opt is not None:
-            v, l = self._opt
-            l = l.strip()
-            self.selects[-1]["options"].append((v if v is not None else l, l))
-            self._opt = None
-        if tag == "a":
-            if self.astack and self.astack.pop():
-                self.inlink -= 1
-                self.spacer()
-            return
-        if self.inlink:
-            return
-        if tag in PARA:
-            self.ensure(2)
-        elif tag in LINE:
-            self.ensure(1)
-        elif tag in INLINE:
-            self.spacer()
-
-    def handle_data(self, d):
-        if self.skip:
-            return
-        if self._opt is not None:
-            self._opt[1] += d
-        d = re.sub(r"\s+", " ", d)
-        if not d.strip():
-            self.spacer()
-            return
-        if not self.tail or self.tail[-1] in " \n":
-            d = d.lstrip()
-        self.put(d)
-
-    def handle_entityref(self, name):          # py2 only
-        try:
-            self.handle_data(unichr_(name2codepoint[name]))
-        except KeyError:
-            self.handle_data("&%s;" % name)
-
-    def handle_charref(self, name):
-        try:
-            n = int(name[1:], 16) if name[0] in "xX" else int(name)
-            self.handle_data(unichr_(n))
-        except Exception:
-            pass
 
 def render(url, html):
     """returns (body, menu, user, links, has_password_field, extra)"""
-    p = T(url)
+    p = HtmlText(url, urlparse(BASE).netloc)
     try:
         p.feed(html)
         p.close()
@@ -586,166 +327,7 @@ def ensure_session():
     return do_login()
 
 # ------------------------------------------------------------ downloads
-def dl_filename(url, r):
-    cd = hdr_get(r, "Content-Disposition")
-    ct = hdr_get(r, "Content-Type").split(";")[0].strip().lower()
-    name = ""
-    m = re.search(r"filename\*\s*=\s*[^']*'[^']*'([^;]+)", cd, re.I)
-    if m:
-        name = unquote(m.group(1).strip().strip('"'))
-    if not name:
-        m = re.search(r'filename\s*=\s*"?([^";]+)"?', cd, re.I)
-        if m:
-            name = m.group(1).strip()
-    if not name:
-        name = unquote(os.path.basename(urlparse(url).path)) or "download"
-    try:                                  # py3 decodes headers as latin-1; undo it for utf-8 names
-        name = name.encode("latin-1").decode("utf-8")
-    except Exception:
-        pass
-    name = os.path.basename(name.replace("\\", "/"))
-    name = re.sub(r'[\x00-\x1f<>:"|?*]', "_", name).strip(" .") or "download"
-    if "." not in name:
-        name += mimetypes.guess_extension(ct) or ""
-    return name
 
-def unique_path(d, name):
-    base, ext = os.path.splitext(name)
-    p, i = os.path.join(d, name), 1
-    while os.path.exists(p):
-        p = os.path.join(d, "%s (%d)%s" % (base, i, ext))
-        i += 1
-    return p
-
-def sniff(path):
-    ext = os.path.splitext(path)[1].lower()
-    with open(path, "rb") as f:
-        data = f.read(65536)
-    if data.startswith(b"%PDF"):
-        return "PDF document"
-    if data[:4] in (b"PK\x03\x04", b"PK\x05\x06"):
-        return "Office document" if ext in (".docx", ".xlsx", ".pptx", ".odt") else "ZIP archive"
-    if data[:2] == b"\x1f\x8b":
-        return "gzip archive"
-    if data and b"\x00" not in data:
-        try:
-            data.decode("utf-8")
-            return "text file"
-        except UnicodeDecodeError:
-            return "text file (not UTF-8)"
-    return "text file" if not data else "binary file"
-
-def which(cmd):
-    for d in os.environ.get("PATH", "").split(os.pathsep):
-        p = os.path.join(d, cmd)
-        if os.path.isfile(p) and os.access(p, os.X_OK):
-            return p
-    return None
-
-def progress(name, got, total, t0, width):
-    el = max(time.time() - t0, 0.001)
-    speed = "%s/s" % hsize(got / el)
-    if total:
-        pct = got * 100.0 / total
-        rest = " %3d%%  %s / %s  %s" % (pct, hsize(got), hsize(total), speed)
-        bw = max(10, width - len(rest) - 4)
-        k = int(bw * got / float(total))
-        bar = "[" + "#" * k + "-" * (bw - k) + "]"
-    else:
-        rest, bar = "  %s  %s" % (hsize(got), speed), ""
-    w("\r\033[2K " + (bar + rest)[:width - 1])
-
-def do_download(url, r):
-    name = dl_filename(url, r)
-    try:
-        os.makedirs(DL_DIR)
-    except OSError:
-        pass
-    dest = unique_path(DL_DIR, name)
-    cl = hdr_get(r, "Content-Length")
-    total = int(cl) if cl.isdigit() else 0
-    width = max(30, min(term_size()[0] - 1, 100))
-    tty = sys.stdout.isatty()
-    w("\n Downloading %s ...\n" % name)
-    part, got, t0, last = dest + ".part", 0, time.time(), 0
-    try:
-        with open(part, "wb") as f:
-            while True:
-                chunk = r.read(65536)
-                if not chunk:
-                    break
-                f.write(chunk)
-                got += len(chunk)
-                if tty and time.time() - last > 0.1:
-                    last = time.time()
-                    progress(name, got, total, t0, width)
-        os.rename(part, dest)
-    except KeyboardInterrupt:
-        try:
-            os.remove(part)
-        except OSError:
-            pass
-        w("\n download cancelled\n")
-        return
-    if tty:
-        progress(name, got, total or got, t0, width)
-        w("\n")
-    secs = time.time() - t0
-    kind = sniff(dest)
-    cols = term_size()[0]
-    rule = "-" * max(20, cols - 1)
-    lines = [rule,
-             " Downloaded  " + name,
-             " Saved to    " + dest,
-             " Size        %s   (%s, %.1fs)" % (hsize(got), kind, secs),
-             rule]
-    opts = []
-    if kind == "ZIP archive":
-        try:
-            infos = zipfile.ZipFile(dest).infolist()
-            lines.append(" Contents (%d entries):" % len(infos))
-            for i in infos[:40]:
-                lines.append("   %9s  %s" % (hsize(i.file_size) if not i.filename.endswith("/") else "", i.filename))
-            if len(infos) > 40:
-                lines.append("   ... and %d more" % (len(infos) - 40))
-            lines.append(rule)
-            opts.append(("x", "extract"))
-        except Exception as e:
-            lines.append(" (cannot read archive: %s)" % e)
-    elif kind == "PDF document":
-        if which("pdftotext"):
-            opts.append(("v", "view as text"))
-        else:
-            lines += [" no 'pdftotext' on this server: copy the file to your computer to read it,",
-                      " e.g.  scp <this-server>:%s ." % dest.replace(" ", "\\ "), rule]
-    elif kind.startswith("text"):
-        opts.append(("v", "view"))
-    for l in lines:
-        w(colorize(fit(l, cols - 1)) + "\n")
-    if opts and sys.stdout.isatty():
-        try:
-            a = input_(" [%s]  Enter = continue: " % "  ".join("%s = %s" % o for o in opts)).strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return
-        if a == "x" and ("x", "extract") in opts:
-            out = os.path.splitext(dest)[0]
-            try:
-                zipfile.ZipFile(dest).extractall(out)
-                print(" extracted to " + out)
-            except Exception as e:
-                print(" extract failed:", e)
-        elif a == "v" and ("v", "view") in opts:
-            with open(dest, "rb") as f:
-                txt = f.read().decode("utf-8", "replace").replace("\t", "    ")
-            clear_screen()
-            paged(wrap(txt, max(20, cols - 1)), term_size()[1], color=False)
-        elif a == "v":
-            try:
-                txt = subprocess.check_output(["pdftotext", "-layout", dest, "-"]).decode("utf-8", "replace")
-                clear_screen()
-                paged(txt.split("\n"), term_size()[1], color=False)
-            except Exception as e:
-                print(" pdftotext failed:", e)
 
 def classify(r):
     cd = hdr_get(r, "Content-Disposition").lower()
@@ -772,7 +354,7 @@ def fetch(url):
             raise RuntimeError("too many redirects")
         kind = classify(r)
         if kind == "download":
-            do_download(u, r)
+            do_download(r, DL_DIR, url=u)
             return None
         text = r.read().decode("utf-8", "replace")
         if kind == "json" or "login" in url or logged_in_page(u, text):
@@ -928,22 +510,6 @@ def call_action(role, page_url, args=None, raw=None, ctype=None):
         return code, text
     raise RuntimeError("server action '%s' not found or session lost" % role)
 
-def multipart(items):
-    """items: ('field', name, value) | ('file', name, filename, ctype, bytes)"""
-    bd = "----progenv" + binascii.hexlify(os.urandom(12)).decode()
-    out = []
-    for it in items:
-        if it[0] == "field":
-            out.append(B('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n' % (bd, it[1])))
-            out.append(B(it[2]))
-        else:
-            fn = it[2].replace('"', "%22")
-            out.append(B('--%s\r\nContent-Disposition: form-data; name="%s"; filename="%s"\r\n'
-                         'Content-Type: %s\r\n\r\n' % (bd, it[1], fn, it[3])))
-            out.append(it[4])
-        out.append(b"\r\n")
-    out.append(B("--%s--\r\n" % bd))
-    return b"".join(out), "multipart/form-data; boundary=" + bd
 
 TASK_RE = re.compile(r"^(https?://[^/]+)((?:/[a-z]{2})?)(/courses/\d+/groups/\d+/topics/\d+/tasks/\d+)")
 
@@ -1324,11 +890,6 @@ def pick_language(cur, fname):
     a = input_(" Language value [%s] (known: cs = C#): " % default).strip() or default
     return a
 
-def yes(prompt):
-    try:
-        return input_(prompt).strip().lower() in ("y", "yes", "i", "igen")
-    except (EOFError, KeyboardInterrupt):
-        return False
 
 def cmd_upload(cur, arg):
     pt = parse_task(cur.url)
@@ -1524,27 +1085,12 @@ HINT = " <n> open link   g <path>   b back   r reload   / search   ? help   q qu
 HINT_TASK = " up = upload file   subs = submissions   sub <n> = details   code <n> = source   opts   actions"
 
 def draw(p):
-    cols, rows = term_size()
-    width = max(20, cols - 1)
-    rule = "-" * width
     head = " %s  [%s]" % (p.url, p.code)
     if p.user:
         head += "   user: " + p.user
-    lines = [rule] + wrap(head, width) + [rule]
-    if p.menu:
-        lines += wrap(" " + p.menu, width) + [rule]
-    lines += wrap(p.body, width)
-    lines += ["", rule, fit(HINT, width)]
-    if parse_task(p.url):
-        lines.append(fit(HINT_TASK, width))
-    clear_screen()
-    paged(lines, rows)
+    hints = [HINT] + ([HINT_TASK] if parse_task(p.url) else [])
+    show_screen([head], [p.body], hints, menu=p.menu)
 
-def framed(title, body_lines):
-    cols, rows = term_size()
-    width = max(20, cols - 1)
-    rule = "-" * width
-    paged([rule, fit(" " + title, width), rule] + body_lines + [rule], rows)
 
 HELP = """ <number>      follow link [number]  (files like PDF / zip are downloaded to ~/progenv-downloads)
  g <path|url>  go to e.g. /hu/courses (same host only)

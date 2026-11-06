@@ -17,6 +17,21 @@ GO_VERSION=1.21.6
 GO_TARBALL="go${GO_VERSION}.linux-amd64.tar.gz"
 GO_URL="https://go.dev/dl/${GO_TARBALL}"
 
+ensure_key_auth() {
+    # Already works without a password?
+    if ssh -q -o BatchMode=yes -o ConnectTimeout=5 "$SERVER" true 2>/dev/null; then
+        echo "==> Key auth already works."
+        return
+    fi
+    [ -f "$HOME/.ssh/id_ed25519" ] || {
+        echo "==> Generating SSH key ..."
+        mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+        ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519"
+    }
+    echo "==> Installing key on $SERVER (last time you'll type the password) ..."
+    ssh-copy-id -i "$HOME/.ssh/id_ed25519.pub" "$SERVER"
+}
+
 build_static_sasshimi() {
     local work; work=$(mktemp -d /tmp/sasshimi-build.XXXXXX)
     cleanup() { [ -d "$work" ] && { chmod -R u+w "$work" 2>/dev/null; rm -rf "$work"; }; return 0; }
@@ -58,7 +73,7 @@ EOSH
 
 stage_remote() {
     echo "==> Uploading $(du -h "$BIN" | cut -f1) to $SERVER:$REMOTE_BIN ..."
-    ssh "$SERVER" "cat > $REMOTE_BIN.tmp && chmod 755 $REMOTE_BIN.tmp && mv $REMOTE_BIN.tmp $REMOTE_BIN && test -x $REMOTE_BIN" < "$BIN" \
+    ssh -q "$SERVER" "cat > $REMOTE_BIN.tmp && chmod 755 $REMOTE_BIN.tmp && mv $REMOTE_BIN.tmp $REMOTE_BIN && test -x $REMOTE_BIN" < "$BIN" \
         || { echo "!! remote staging failed" >&2; exit 1; }
 }
 
@@ -71,9 +86,9 @@ BIN="$BIN"
 WRAPPER="$WRAPPER"
 [ -x "\$BIN" ]     || { echo "!! \$BIN missing — run setup-sasshimi.sh" >&2; exit 1; }
 [ -x "\$WRAPPER" ] || { echo "!! \$WRAPPER missing — run setup-sasshimi.sh" >&2; exit 1; }
-if ! ssh -o BatchMode=yes -o ConnectTimeout=3 "$SERVER" "test -x $REMOTE_BIN" 2>/dev/null; then
+if ! ssh -q -o BatchMode=yes -o ConnectTimeout=3 "$SERVER" "test -x $REMOTE_BIN" 2>/dev/null; then
     echo ">>> Re-staging $REMOTE_BIN on $SERVER ..."
-    ssh "$SERVER" "cat > $REMOTE_BIN.tmp && chmod 755 $REMOTE_BIN.tmp && mv $REMOTE_BIN.tmp $REMOTE_BIN" < "\$BIN"
+    ssh -q "$SERVER" "cat > $REMOTE_BIN.tmp && chmod 755 $REMOTE_BIN.tmp && mv $REMOTE_BIN.tmp $REMOTE_BIN" < "\$BIN"
 fi
 exec "\$BIN" server "$SERVER" --bind "127.0.0.1:$PORT" --remote_executable "\$WRAPPER"
 EOF
@@ -82,6 +97,8 @@ EOF
 
 main() {
     mkdir -p "$BIN_DIR"
+    ensure_key_auth
+
     local rebuild=0
     if [ -x "$BIN" ]; then
         echo "==> Found $BIN ($(du -h "$BIN" | cut -f1)) — $(file -b "$BIN" | cut -d, -f1-2)"

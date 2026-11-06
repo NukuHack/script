@@ -408,6 +408,8 @@ def scr_task(tid):
         flags.append("limit %s submissions" % t["submissionLimit"])
     if flags:
         s.add("Info: " + ", ".join(flags))
+    if t.get("entryPasswordProtected"):
+        s.add("      entry password required: type  pw  (see  pwcfg  if not configured yet)")
     s.add("", "### My submission")
     if sub:
         s.ctx["subid"] = sub.get("id")
@@ -545,6 +547,67 @@ def cmd_upload(cur, arg):
         watch(t, subid)
     print(" raw responses are logged in %s" % LOG_FILE)
 
+# ------------------------------------------------------------ entry password
+# The web UI's exact password request is not documented. Capture it once in the browser
+# (DevTools -> Network -> submit the password -> right click the request -> Copy as cURL),
+# then describe it here with the same syntax as the `api` command:
+#     pwcfg POST /student/tasks/{id}/<what-you-saw> {"password":"{pw}"}
+# {id} = task id, {pw} = the password (JSON-escaped). It is saved in ~/.tms_client.json
+# (without any password). Env var TMS_PW_REQ overrides it.
+def pw_spec():
+    return os.environ.get("TMS_PW_REQ") or CFG.get("pw_req") or ""
+
+def parse_spec(spec):
+    toks = spec.split(None, 2)
+    if len(toks) < 2 or toks[0].upper() not in ("GET", "POST", "PUT", "PATCH", "DELETE"):
+        return None
+    return toks[0].upper(), toks[1], (toks[2] if len(toks) > 2 else None)
+
+def cmd_pwcfg(arg):
+    if not arg.strip():
+        print(" current: %s" % (pw_spec() or "(not set)"))
+        print(" usage:   pwcfg POST /student/tasks/{id}/<path> {\"password\":\"{pw}\"}")
+        print("          (copy method/path/body from the browser's Network tab; {id} and {pw} are filled in)")
+        return
+    if arg.strip() == "clear":
+        CFG.pop("pw_req", None)
+        save_cfg()
+        print(" cleared")
+        return
+    if not parse_spec(arg):
+        print(" format: METHOD /path [json-body]")
+        return
+    CFG["pw_req"] = arg.strip()
+    save_cfg()
+    print(" saved")
+
+def cmd_pw(cur, arg):
+    t = cur.ctx.get("task") if cur else None
+    if not t:
+        print(" open a task first")
+        return
+    spec = parse_spec(pw_spec())
+    if not spec:
+        print(" the password request is not configured yet. Run  pwcfg  for how.")
+        return
+    method, path, body = spec
+    pw = arg if arg else getpass.getpass(" Entry password: ")
+    if not pw:
+        return
+    path = path.replace("{id}", "%s" % t.get("id"))
+    if body:
+        body = body.replace("{id}", "%s" % t.get("id")).replace("{pw}", json.dumps(pw)[1:-1])
+    print(" %s %s%s" % (method, path, "   body: " + re.sub(r"(?s)" + re.escape(json.dumps(pw)[1:-1]), "***", body) if body else ""))
+    code, r = api_request(method, path, body)
+    text = r.read().decode("utf-8", "replace")
+    log("pw %s %s -> %s %s" % (method, path, code, text[:2000].replace("\n", "\\n")))
+    if code >= 400:
+        print(" rejected: " + err_text(code, text))
+        return
+    print(" accepted (HTTP %s)%s" % (code, (": " + fit(text.strip(), 150)) if text.strip() else ""))
+    S["me"] = None
+    go(S["cur"][1], S["cur"][2], push=False)
+
 def watch(t, subid):
     cols = term_size()[0]
     width = max(20, cols - 1)
@@ -603,6 +666,7 @@ HELP = """ <number>      open the item with that number (files/submissions are d
  quiz          quiz instances (read-only; pick one for its results)         me   your settings
  on a task:    up [file]  upload (asks first, then watches auto-test)    at  auto-test results
                get  download my submission     report  download my report
+               pw [password]  enter the task's entry password   pwcfg  set up that request
  api [METHOD] <path> [json]   any API call (anything but GET asks first)
  token         check the cached token         relogin   logout   q quit
  (long screens: Enter = next screen, a = show all, q = stop)""".split("\n")
@@ -754,6 +818,10 @@ def main():
                 except OSError:
                     pass
                 print("token removed")
+            elif verb == "pwcfg":
+                cmd_pwcfg(arg)
+            elif verb in ("pw", "password"):
+                cmd_pw(cur, arg)
             elif verb in ("up", "upload", "submit"):
                 cmd_upload(cur, arg) if cur else print(" open a task first")
             elif verb in ("at", "get", "report"):

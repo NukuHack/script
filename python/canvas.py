@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # canvas: terminal client for https://canvas.elte.hu  (python 2.7 / 3, stdlib only)
 # Logs in through the ELTE IdP (Neptun login, SAML) and keeps the session cookies in
-# ~/.canvas_cookies, so the login is only asked for when the session has expired.
+# elteui/tmp/canvas/cookie, so the login is only asked for when the session has expired.
 # Screens are built from the Canvas JSON API (/api/v1, session-cookie auth); any other
 # page can be shown as text with  g <path>.
 from __future__ import print_function
@@ -20,15 +20,15 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 try:
     from elteui import *               # shared rendering / download / terminal helpers
 except ImportError:
-    sys.stderr.write("elteui.py must be in the same folder as this script\n")
+    sys.stderr.write("the elteui/ folder must be next to this script\n")
     sys.exit(1)
 
 BASE = os.environ.get("CANVAS_BASE", "https://canvas.elte.hu").rstrip("/")
 START = BASE + "/belepes/"
 HOST = urlparse(BASE).netloc
-COOKIE_FILE = os.path.expanduser(os.environ.get("CANVAS_COOKIES", "~/.canvas_cookies"))
-CFG_FILE = os.path.expanduser("~/.canvas_client.json")
-LOG_FILE = os.path.expanduser("~/.canvas_last.log")
+# internal files live in  elteui/tmp/canvas/{cookie,cfg,log}  (old ~/.canvas_* files are moved in once)
+SITE = Site("canvas", env={"cookie": "CANVAS_COOKIES"},
+            legacy={"cookie": "~/.canvas_cookies", "cfg": "~/.canvas_client.json", "log": "~/.canvas_last.log"})
 DL_DIR = os.path.expanduser(os.environ.get("CANVAS_DL", "~/canvas-downloads"))
 UA = "Mozilla/5.0 (X11; Linux x86_64) canvas-cli"
 
@@ -43,31 +43,19 @@ class LoginError(ApiError):
     pass
 
 
-# ------------------------------------------------------------ config / cookies / log
+# ------------------------------------------------------------ config / cookies / log  (all in SITE)
 def load_cfg():
-    try:
-        with open(CFG_FILE) as f:
-            CFG.update(json.load(f))
-    except Exception:
-        pass
+    CFG.update(SITE.read_json("cfg"))
 
 def save_cfg():
     try:
-        fd = os.open(CFG_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump(CFG, f)
+        SITE.write_json("cfg", CFG)
     except Exception:
         pass
 
-def log(s):
-    try:
-        fd = os.open(LOG_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        with os.fdopen(fd, "ab") as f:
-            f.write(B("%s %s\n" % (time.strftime("%H:%M:%S"), s)))
-    except Exception:
-        pass
+log = SITE.log
 
-JAR = cookielib.LWPCookieJar(COOKIE_FILE)
+JAR = cookielib.LWPCookieJar(SITE.path("cookie"))
 OPENER = ur.build_opener(ur.HTTPCookieProcessor(JAR))
 
 def load_jar():
@@ -78,8 +66,7 @@ def load_jar():
 
 def save_jar():
     try:
-        if not os.path.exists(COOKIE_FILE):
-            os.close(os.open(COOKIE_FILE, os.O_WRONLY | os.O_CREAT, 0o600))
+        SITE.touch("cookie")
         JAR.save(ignore_discard=True, ignore_expires=True)
     except Exception:
         pass
@@ -282,11 +269,11 @@ def follow(r):
 def credentials():
     u, p = os.environ.get("CANVAS_USER"), os.environ.get("CANVAS_PASS")
     if u and p:
-        return u, p, True
+        return u.upper(), p, True
     if not sys.stdin.isatty():
         raise LoginError("no CANVAS_USER/CANVAS_PASS set and no terminal to ask on")
-    d = CFG.get("user", "")
-    u = input_("Neptun code%s: " % (" [%s]" % d if d else "")).strip() or d
+    d = CFG.get("user", "").upper()
+    u = (input_("Neptun code%s: " % (" [%s]" % d if d else "")).strip() or d).upper()
     p = getpass.getpass("Neptun password: ")
     return u, p, False
 
@@ -362,11 +349,13 @@ def api(path, method="GET", fields=None, paged=True, retry=True, headers=None, r
         code = r.getcode()
         text = body_of(r)
         log("%s %s -> %s %s" % (method, url, code, text[:3000].replace("\n", "\\n")))
-        if code == 401 or text.lstrip()[:1] == "<":            # not logged in (html login page)
-            if retry:
+        if code == 401 or text.lstrip()[:1] == "<":            # html login page, or 401
+            if retry and whoami() is None:                      # really logged out: log in once more
                 print("(session expired, logging in again)")
                 do_login()
                 return api(path, method, fields, paged, False, headers, raw)
+            if code == 401 and text.lstrip()[:1] != "<":
+                raise ApiError("no access to this item (HTTP 401)")
             raise ApiError("not logged in")
         if code >= 400:
             raise ApiError(err_text(code, text))
@@ -393,6 +382,19 @@ def download_url(url, hint=""):
     if ct == "text/html" and "attachment" not in hdr_get(r, "Content-Disposition").lower():
         raise ApiError("got a web page instead of a file (no permission, or the session expired)")
     do_download(r, DL_DIR, hint, url)
+
+def download_link(url, fid):
+    """a /files/<id> page link carries the course and verifier, so fetch <link>/download first"""
+    p = urlparse(url)
+    path = p.path.rstrip("/")
+    if not path.endswith("/download"):
+        path += "/download"
+    dl = "%s://%s%s%s" % (p.scheme or "https", p.netloc or HOST, path, ("?" + p.query) if p.query else "")
+    try:
+        download_url(dl)
+    except ApiError as e:
+        log("link download failed (%s), trying the API" % e)
+        download_file(fid)
 
 def download_file(fid):
     f = api("/api/v1/files/%s" % fid) or {}
@@ -435,7 +437,7 @@ def route(url):
         return scr_assignment, (m.group(1), m.group(2))
     m = re.search(r"/files/(\d+)", path)
     if m:
-        download_file(m.group(1))
+        download_link(url, m.group(1))
         return None
     m = re.search(r"/courses/(\d+)/pages/([^/]+)", path)
     if m:

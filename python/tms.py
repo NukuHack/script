@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # tms: terminal client for https://tms.inf.elte.hu  (python 2.7 / 3, stdlib only)
-# Shares the token file with tms.sh (~/.tms_token), asks for login only when needed.
+# Keeps its token in elteui/tmp/tms/token (override: TMS_TOKEN_FILE, e.g. to share it with tms.sh).
 from __future__ import print_function
 import os, sys, re, json, time, base64, getpass, textwrap
 import mimetypes, binascii, datetime, zipfile, subprocess
@@ -16,13 +16,16 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 try:
     from elteui import *               # shared rendering / download / terminal helpers
 except ImportError:
-    sys.stderr.write("elteui.py must be in the same folder as this script\n")
+    sys.stderr.write("the elteui/ folder must be next to this script\n")
     sys.exit(1)
 
 BASE = os.environ.get("TMS_BASE", "https://tms.inf.elte.hu/api").rstrip("/")
-TOKEN_FILE = os.environ.get("TMS_TOKEN_FILE") or os.path.expanduser("~/.tms_token")
-CFG_FILE = os.path.expanduser("~/.tms_client.json")
-LOG_FILE = os.path.expanduser("~/.tms_last.log")
+# internal files live in  elteui/tmp/tms/{token,cfg,log}  (old ~/.tms_* files are moved in once;
+# tms.sh can follow with TMS_TOKEN_FILE=<that token path>)
+SITE = Site("tms", env={"token": "TMS_TOKEN_FILE"},
+            legacy={"token": "~/.tms_token", "cfg": "~/.tms_client.json", "log": "~/.tms_last.log"})
+TOKEN_FILE = SITE.path("token")
+LOG_FILE = SITE.path("log")
 DL_DIR = os.path.expanduser(os.environ.get("TMS_DL", "~/tms-downloads"))
 UA = "Mozilla/5.0 (X11; Linux x86_64) tms-cli"
 WATCH_SECS = 120
@@ -40,17 +43,11 @@ S = {"me": None, "sems": None, "cur": None, "hist": []}
 
 # ------------------------------------------------------------ config / token / login
 def load_cfg():
-    try:
-        with open(CFG_FILE) as f:
-            CFG.update(json.load(f))
-    except Exception:
-        pass
+    CFG.update(SITE.read_json("cfg"))
 
 def save_cfg():
     try:
-        fd = os.open(CFG_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump(CFG, f)
+        SITE.write_json("cfg", CFG)
     except Exception:
         pass
 
@@ -63,13 +60,7 @@ def jwt_exp(tok):
         return None
 
 def save_token(t):
-    try:
-        os.remove(TOKEN_FILE)
-    except OSError:
-        pass
-    fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(t)
+    SITE.write("token", t)
 
 class ApiError(Exception):
     pass
@@ -135,8 +126,7 @@ def login():
 def ensure_token():
     if not TOKEN["v"]:
         try:
-            with open(TOKEN_FILE) as f:
-                TOKEN["v"] = f.read().strip()
+            TOKEN["v"] = SITE.read("token").strip()
         except Exception:
             TOKEN["v"] = ""
     exp = jwt_exp(TOKEN["v"]) if TOKEN["v"] else None
@@ -145,13 +135,7 @@ def ensure_token():
     return TOKEN["v"]
 
 # ------------------------------------------------------------ api
-def log(s):
-    try:
-        fd = os.open(LOG_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        with os.fdopen(fd, "ab") as f:
-            f.write(B("%s %s\n" % (time.strftime("%H:%M:%S"), s)))
-    except Exception:
-        pass
+log = SITE.log
 
 def api_request(method, path, body=None, ctype=None):
     """returns (code, open_response); one automatic re-login on 401"""

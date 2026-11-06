@@ -1,43 +1,14 @@
 # -*- coding: utf-8 -*-
-# elteui: shared terminal UI / rendering library for progenv.py and tms.py
-#   * terminal helpers: size, colors, wrapping, paging, framed screens
+# elteui.render: everything that draws to the terminal or turns data into text
+#   * terminal: size, colors, wrapping, paging, framed screens, prompts
 #   * renderers: HTML -> text (HtmlText), Markdown -> text (md_to_text), JSON -> text (json_lines)
-#   * downloads with progress bar, zip listing, text/pdf viewing; multipart bodies; Budapest dates
-# python 2.7 / 3, stdlib only. Keep this file next to progenv.py and tms.py.
+#   * downloads with progress bar, zip listing, text/pdf viewing
+# python 2.7 / 3, stdlib only. Depends on elteui.utils, never the other way round.
 from __future__ import print_function
-import os, sys, re, json, time, textwrap, mimetypes, binascii, datetime, zipfile, subprocess
-
-try:                                   # py2
-    import urllib2 as ur
-    from urlparse import urljoin, urlparse
-    from urllib import unquote
-    from HTMLParser import HTMLParser
-    from htmlentitydefs import name2codepoint
-    import Queue as queue
-    input_ = raw_input
-    unichr_ = unichr
-    string_types = basestring
-except ImportError:                    # py3
-    import urllib.request as ur
-    from urllib.parse import urljoin, urlparse, unquote
-    from html.parser import HTMLParser
-    from html.entities import name2codepoint
-    import queue
-    input_ = input
-    unichr_ = chr
-    string_types = str
-
-try:
-    import readline
-except ImportError:
-    readline = None
-
-# ------------------------------------------------------------ terminal
-
-def B(s):
-    return s if isinstance(s, bytes) else s.encode("utf-8")
+from .utils import *
 
 COLOR = sys.stdout.isatty() and os.environ.get("TERM", "dumb") != "dumb"
+
 
 def term_size():
     try:
@@ -56,6 +27,7 @@ def term_size():
     except Exception:
         return 80, 24
 
+
 def w(s):
     if not isinstance(s, bytes):
         enc = getattr(sys.stdout, "encoding", None) or "utf-8"
@@ -64,10 +36,11 @@ def w(s):
     out.write(s)
     out.flush()
 
+
 def col(code, s):
     return "\033[%sm%s\033[0m" % (code, s) if COLOR else s
 
-# ------------------------------------------------------------ colors for status words
+
 WORD_COL = {"SUCCESS": "1;32", "PASS": "1;32", "PASSED": "1;32", "OK": "32", "ACCEPTED": "1;32",
             "VERIFIED": "32", "OPEN": "1;32",
             "FAILED": "1;31", "FAILURE": "1;31", "ERROR": "1;31", "WRONG": "1;31", "CRASH": "1;31",
@@ -75,8 +48,11 @@ WORD_COL = {"SUCCESS": "1;32", "PASS": "1;32", "PASSED": "1;32", "OK": "32", "AC
             "PART": "1;33", "WARNING": "33", "LATE": "1;33", "NOT SUBMITTED": "33",
             "RUNNING": "1;36", "PENDING": "36", "QUEUED": "36", "WAITING": "36", "COMPILING": "36",
             "EVALUATING": "36", "UPCOMING": "36", "SUBMITTED": "36"}
+
+
 WORD_RE = re.compile(r"\b(NOT SUBMITTED|" + "|".join(sorted(
     [k for k in WORD_COL if " " not in k], key=len, reverse=True)) + r")\b")
+
 
 def colorize(line):
     if re.match(r"^#{1,3} ", line):
@@ -84,13 +60,16 @@ def colorize(line):
     line = re.sub(r"\[(\d+)\]", lambda m: col("1;36", m.group(0)), line)
     return WORD_RE.sub(lambda m: col(WORD_COL[m.group(1)], m.group(1)), line)
 
+
 def clear_screen():
     if COLOR:
         w("\033[H\033[2J\033[3J")
 
+
 def erase_prev_line():
     if COLOR:
         w("\033[1A\033[2K\r")
+
 
 def wrap(text, width):
     out = []
@@ -103,9 +82,11 @@ def wrap(text, width):
         out.extend(textwrap.wrap(ln, width, subsequent_indent=sub) or [""])
     return out
 
+
 def fit(s, width):
     s = "%s" % s
     return s if len(s) <= width else s[:max(0, width - 3)] + "..."
+
 
 def paged(lines, rows, color=True):
     f = colorize if color else (lambda s: s)
@@ -127,18 +108,13 @@ def paged(lines, rows, color=True):
                 w("\n".join(f(l) for l in lines[i:]) + "\n")
                 break
 
-def hsize(n):
-    n = float(n)
-    for u in ("B", "KB", "MB", "GB"):
-        if n < 1024 or u == "GB":
-            return ("%d %s" % (n, u)) if u == "B" else ("%.1f %s" % (n, u))
-        n /= 1024.0
 
 def yes(prompt):
     try:
         return input_(prompt).strip().lower() in ("y", "yes", "i", "igen")
     except (EOFError, KeyboardInterrupt):
         return False
+
 
 def ask_path(prompt):
     if not readline:
@@ -158,127 +134,13 @@ def ask_path(prompt):
         readline.set_completer(old)
         readline.set_completer_delims(olddel)
 
+
 def framed(title, body_lines):
     cols, rows = term_size()
     width = max(20, cols - 1)
     rule = "-" * width
     paged([rule, fit(" " + title, width), rule] + body_lines + [rule], rows)
 
-# ------------------------------------------------------------ dates (Europe/Budapest without a tz database)
-
-def utcnow():
-    return datetime.datetime(1970, 1, 1) + datetime.timedelta(seconds=time.time())
-
-def bud_offset(utc):
-    y = utc.year
-    def last_sun(month):
-        d = datetime.datetime(y, month, 31, 1)
-        return d - datetime.timedelta(days=(d.weekday() + 1) % 7)
-    return 2 if last_sun(3) <= utc < last_sun(10) else 1
-
-def parse_dt(s):
-    """returns (utc, local_budapest) naive datetimes, or None"""
-    m = re.match(r"^(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d)(?::(\d\d))?(?:\.\d+)?\s*(Z|[+-]\d\d:?\d\d)?$",
-                 "%s" % (s or ""))
-    if not m:
-        return None
-    y, mo, d, h, mi = [int(x) for x in m.groups()[:5]]
-    se = int(m.group(6) or 0)
-    dt = datetime.datetime(y, mo, d, h, mi, se)
-    tz = m.group(7)
-    if tz is None:                                   # naive: assume it is already Budapest time
-        utc = dt - datetime.timedelta(hours=bud_offset(dt - datetime.timedelta(hours=1)))
-        return utc, dt
-    off = 0
-    if tz != "Z":
-        t = tz.replace(":", "")
-        off = (1 if t[0] == "+" else -1) * (int(t[1:3]) * 60 + int(t[3:5]))
-    utc = dt - datetime.timedelta(minutes=off)
-    return utc, utc + datetime.timedelta(hours=bud_offset(utc))
-
-def fmt_dt(s, short=False):
-    p = parse_dt(s)
-    if not p:
-        return "%s" % (s or "-")
-    return p[1].strftime("%m-%d %H:%M" if short else "%Y-%m-%d %H:%M")
-
-def rel(s):
-    p = parse_dt(s)
-    if not p:
-        return ""
-    secs = int((p[0] - utcnow()).total_seconds())
-    a = abs(secs)
-    if a < 3600:
-        t = "%dm" % (a // 60)
-    elif a < 86400:
-        t = "%dh %dm" % (a // 3600, a % 3600 // 60)
-    else:
-        t = "%dd %dh" % (a // 86400, a % 86400 // 3600)
-    return ("in " + t) if secs >= 0 else (t + " ago")
-
-# ------------------------------------------------------------ downloads
-
-def hdr_get(r, name, default=""):
-    try:
-        return r.info().get(name, default) or default
-    except Exception:
-        return default
-
-def dl_filename(r, hint="", url=""):
-    cd = hdr_get(r, "Content-Disposition")
-    ct = hdr_get(r, "Content-Type").split(";")[0].strip().lower()
-    name = ""
-    m = re.search(r"filename\*\s*=\s*[^']*'[^']*'([^;]+)", cd, re.I)
-    if m:
-        name = unquote(m.group(1).strip().strip('"'))
-    if not name:
-        m = re.search(r'filename\s*=\s*"?([^";]+)"?', cd, re.I)
-        if m:
-            name = m.group(1).strip()
-    if not name:
-        name = hint or unquote(os.path.basename(urlparse(url).path)) or "download"
-    try:
-        name = name.encode("latin-1").decode("utf-8")
-    except Exception:
-        pass
-    name = os.path.basename(name.replace("\\", "/"))
-    name = re.sub(r'[\x00-\x1f<>:"|?*]', "_", name).strip(" .") or "download"
-    if "." not in name:
-        name += mimetypes.guess_extension(ct) or ""
-    return name
-
-def unique_path(d, name):
-    base, ext = os.path.splitext(name)
-    p, i = os.path.join(d, name), 1
-    while os.path.exists(p):
-        p = os.path.join(d, "%s (%d)%s" % (base, i, ext))
-        i += 1
-    return p
-
-def sniff(path):
-    ext = os.path.splitext(path)[1].lower()
-    with open(path, "rb") as f:
-        data = f.read(65536)
-    if data.startswith(b"%PDF"):
-        return "PDF document"
-    if data[:4] in (b"PK\x03\x04", b"PK\x05\x06"):
-        return "Office document" if ext in (".docx", ".xlsx", ".pptx", ".odt") else "ZIP archive"
-    if data[:2] == b"\x1f\x8b":
-        return "gzip archive"
-    if data and b"\x00" not in data:
-        try:
-            data.decode("utf-8")
-            return "text file"
-        except UnicodeDecodeError:
-            return "text file (not UTF-8)"
-    return "text file" if not data else "binary file"
-
-def which(cmd):
-    for d in os.environ.get("PATH", "").split(os.pathsep):
-        p = os.path.join(d, cmd)
-        if os.path.isfile(p) and os.access(p, os.X_OK):
-            return p
-    return None
 
 def progress(got, total, t0, width):
     el = max(time.time() - t0, 0.001)
@@ -291,6 +153,7 @@ def progress(got, total, t0, width):
     else:
         rest, bar = "  %s  %s" % (hsize(got), speed), ""
     w("\r\033[2K " + (bar + rest)[:width - 1])
+
 
 def do_download(r, dest_dir, hint="", url=""):
     name = dl_filename(r, hint, url)
@@ -380,31 +243,18 @@ def do_download(r, dest_dir, hint="", url=""):
             except Exception as e:
                 print(" pdftotext failed:", e)
 
-def multipart(items):
-    bd = "----elte" + binascii.hexlify(os.urandom(12)).decode()
-    out = []
-    for it in items:
-        if it[0] == "field":
-            out.append(B('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n' % (bd, it[1])))
-            out.append(B(it[2]))
-        else:
-            fn = it[2].replace('"', "%22")
-            out.append(B('--%s\r\nContent-Disposition: form-data; name="%s"; filename="%s"\r\n'
-                         'Content-Type: %s\r\n\r\n' % (bd, it[1], fn, it[3])))
-            out.append(it[4])
-        out.append(b"\r\n")
-    out.append(B("--%s--\r\n" % bd))
-    return b"".join(out), "multipart/form-data; boundary=" + bd
-
-# ------------------------------------------------------------ HTML -> text
 
 SKIP = set(["script", "style", "head", "svg", "noscript", "template"])
 
+
 PARA = set("p h1 h2 h3 h4 h5 h6 ul ol table".split())
+
 
 LINE = set("li tr br div section article header footer main nav form dl dt dd aside pre".split())
 
+
 INLINE = set("span button label small strong b em i code time td th option".split())
+
 
 class HtmlText(HTMLParser):
     def __init__(self, base, host=None):
@@ -530,13 +380,14 @@ class HtmlText(HTMLParser):
         except Exception:
             pass
 
-# ------------------------------------------------------------ JSON -> text
 
 PRIO = ["id", "name", "title", "status", "translatedStatus", "grade", "points", "maxPoints", "score",
         "taskID", "uploadTime", "date", "startDate", "endDate", "startTime", "type", "text", "message"]
 
+
 def is_scalar(v):
     return not isinstance(v, (dict, list))
+
 
 def fmtval(v):
     if v is None:
@@ -550,6 +401,7 @@ def fmtval(v):
             return fmt_dt(v)
         return v.replace("\r", "").replace("\n", " ")
     return "%s" % v
+
 
 def table_lines(rows, width, indent=0):
     keys, count = [], {}
@@ -576,6 +428,7 @@ def table_lines(rows, width, indent=0):
     for n, c in enumerate(cells, 1):
         out.append(pad + "%3d  " % n + "  ".join("%-*s" % (wd[i], fit(x, wd[i])) for i, x in enumerate(c)))
     return out
+
 
 def json_lines(obj, width, indent=0):
     pad = " " * indent
@@ -613,9 +466,9 @@ def json_lines(obj, width, indent=0):
         out.append(pad + fmtval(obj))
     return out
 
-# ------------------------------------------------------------ Markdown -> text
 
 ENT = {"&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#39;": "'", "&nbsp;": " "}
+
 
 def md_to_text(s):
     if not s:
@@ -642,7 +495,7 @@ def md_to_text(s):
         out.append(ln.rstrip())
     return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
 
-# ------------------------------------------------------------ screens
+
 def show_screen(head_lines, body_lines, hints=(), menu=""):
     """clear the terminal and draw: rule, header, rule, [menu, rule], body, rule, hints (paged if tall)"""
     cols, rows = term_size()

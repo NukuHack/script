@@ -15,14 +15,15 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 try:
     from elteui import *               # shared rendering / download / terminal helpers
 except ImportError:
-    sys.stderr.write("elteui.py must be in the same folder as this script\n")
+    sys.stderr.write("the elteui/ folder must be next to this script\n")
     sys.exit(1)
 
 BASE = os.environ.get("PROGENV_BASE", "https://progenv.inf.elte.hu").rstrip("/")
 START = BASE + "/hu/"
 LOGIN = BASE + "/hu/login"
-STATE_FILE = os.path.expanduser("~/.progenv.json")
-STREAM_LOG = os.path.expanduser("~/.progenv_stream.log")
+# internal files live in  elteui/tmp/progenv/{cfg,stream}  (old ~/.progenv* files are moved in once)
+SITE = Site("progenv", legacy={"cfg": "~/.progenv.json", "stream": "~/.progenv_stream.log"})
+STREAM_LOG = SITE.path("stream")
 STREAM_URL = BASE + "/api/stream?target=/submissions/stream"
 DL_DIR = os.path.expanduser(os.environ.get("PROGENV_DL", "~/progenv-downloads"))
 MAX_WATCH = 180                         # seconds to follow a run
@@ -43,16 +44,10 @@ NOASK = set()                           # roles the user declined to provide thi
 
 # ------------------------------------------------------------ state file
 def load_state():
-    try:
-        with open(STATE_FILE) as f:
-            state.update(json.load(f))
-    except Exception:
-        pass
+    state.update(SITE.read_json("cfg"))
 
 def save_state():
-    fd = os.open(STATE_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(state, f)
+    SITE.write_json("cfg", state)
 
 # ------------------------------------------------------------ jwt
 def jwt_exp(tok):
@@ -790,8 +785,7 @@ def stream_reader(q, stop):
         q.put(("error", "%s" % e))
 
 def open_log():
-    fd = os.open(STREAM_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    return os.fdopen(fd, "ab")
+    return SITE.open_append("stream")
 
 def watch(page_url, task, target_no, label):
     cols = term_size()[0]

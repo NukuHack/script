@@ -1,0 +1,8 @@
+#LWP-Cookies-2.0
+Set-Cookie3: _csrf_token=UCeiTQhOcWFLzdiygd%2BlZlMWKf2alvvS%2FP9Phhpj8BIGVMh6biNGA3KVt9zKjeNVBEFNls6h0JOdhwPAIgm9VA%3D%3D; path="/"; domain=canvas.elte.hu; path_spec; discard; version=0
+Set-Cookie3: log_session_id=d96ae0655773acc3e07990710df53c4d; path="/"; domain=canvas.elte.hu; path_spec; discard; HttpOnly=None; version=0
+Set-Cookie3: _normandy_session=pq0vI2dUVRlEkpSk2Y2ycQ+zrIDx3ntfXeHHcscVN13G6fX_lZ-C5mdESyddK-S73zJX0_BMfGzzU21RLBdC1AbJ1btrl0XtKetQJejHCuI-wCqMUVEF9Rgvcl1E_NbbHhmq_Y4OVpXDRuadc4yxON1iKZDRY8xFiXbdg3hOyvAxilhw0SjBt0MEVzCNvxSlr_gBrATmqOiKGW4HmRrEAPKIEBoqI3vRsZMpVd16TI-hbe4OROu8ZdmZWBMVkQH7sIy9_kWwpXBrp4faVPtCFyz6qBsdLsoQBXpm1tiCF7joDitn_jVKXhgZy014cqBVCbDoXUGeorz3RPMg2PcLsS-N5waAzINqXaTpoYhGdJQJdmEFlPA73gH44mAXqBI3ZAVrUeJDMI5sxhrV2Qtt11y_GJrRAza32cJmb2bUGJKFxQg-0TWKMQ32gbAqnI-v0UFNwP3hq-Tp0zeDeZhpBO4s4Y_RQQeCx4qi6SjCKQZ9m2QRUY3fqR0MUotYTYCYfVrD4_swYVPirV4JIgY3KQFrCLW4ZyVi1FRmJxJ3e7c1jMev3-3qGs2bwHN4zalMOKDQjLgN1triwiL67V3mq3-_abwJinAnMbKoJTZdEsmoQooTddVQZZlLv5gvUU8U9E.agNTB7ZSL6l2zRsfDflNG--jfRM.au5FbA; path="/"; domain=canvas.elte.hu; path_spec; discard; HttpOnly=None; version=0
+Set-Cookie3: SimpleSAMLSessionID=b1b34c32a13044fb8e0b964c78b92078; path="/auth/"; domain=idp.elte.hu; path_spec; discard; httponly=None; version=0
+Set-Cookie3: SimpleSAMLAuthToken=_2fad4d0fb0105e81ebeccb465d4c30397cb9fb4fa6; path="/auth/"; domain=idp.elte.hu; path_spec; discard; httponly=None; version=0
+Set-Cookie3: PHPSESSID=2l8ofdnmc5g9cemd2o1av8k6v3; path="/"; domain=idp.elte.hu; path_spec; discard; version=0
+Set-Cookie3: language=en; path="/"; domain=idp.elte.hu; path_spec; expires="2029-04-24 21:23:55Z"; version=0

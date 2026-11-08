@@ -64,6 +64,7 @@ alias dir='ls'
 alias open='xdg-open'
 alias py='python'
 alias cls='clear'
+alias cla='clear && ls -A'
 alias sudo='sudo '
 
 alias ls='ls --color=auto'

@@ -127,4 +127,5 @@ cython_debug/
 
 # stuff what i would not like to upload ....
 resources/
-*/bot/
+**/bot/
+**/tmp/

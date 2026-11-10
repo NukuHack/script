@@ -30,7 +30,7 @@ mkcd() {
 }
 
 md() {
-    patine "$1" --ascii | less -R
+    patn "$1" --ascii | less -R
 }
 # Extract any archive, whatever its type
 extract() {

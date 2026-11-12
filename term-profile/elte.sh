@@ -2,6 +2,7 @@
 # ELTE environment setup for shell sessions.
 
 neptun_code="i7zbe7"
+pandora="pandora"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -55,6 +56,13 @@ setup_elte_ssh() {
         echo ""
 
         echo "Hello you Elte student! (over SSH)"
+
+        if [ "$pandora" == "$(hostname)" ] || [ "$(uname -m)" == "i686" ]; then
+            add_to_path_if_exists "$HOME/.local/bin/i686:$PATH"
+            echo "You are on 32bit cpu !Awful!"
+        else
+            add_to_path_if_exists "$HOME/.local/bin/x86_64:$PATH"
+        fi
 
         # Enable mesg in ELTE session(s).
         mesg y

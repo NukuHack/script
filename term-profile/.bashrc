@@ -16,6 +16,9 @@ if [[ $- == *i* ]]; then
 	bind 'TAB:menu-complete'
 fi
 
+# to make it visible for other apps nicely
+shopt -s expand_aliases
+
 # Uncomment the following line if you don't like systemctl's auto-paging feature:
 # export SYSTEMD_PAGER=
 

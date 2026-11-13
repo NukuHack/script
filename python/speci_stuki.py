@@ -1,8 +1,8 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-csharp_to_stuki.py
--------------------
+speci_stuki.py
+--------------
 Turn C# method(s) into a shareable progalap.elte.hu/stuki structogram URL
 (?data=<gzip+base64 of the app's own Redux state>). Every method found in
 the input becomes its own structogram; they all load into the editor
@@ -38,10 +38,9 @@ Scope / honesty about limits:
     types (only the first initializer survives). Anything genuinely
     unrecognized is kept as a literal statement line rather than crashing.
 
-Usage:
-  python2 csharp_to_stuki.py path/to/Program.cs
-  python2 csharp_to_stuki.py < Program.cs
-  python2 csharp_to_stuki.py            # runs a built-in demo (2 methods)
+Usage: run with no arguments for the full help text. This file also builds
+progalap.elte.hu/specifikacio URLs from specification text (the old
+str2speci.py is merged in).
 """
 from __future__ import print_function
 
@@ -57,6 +56,48 @@ try:                                   # Python 3 (kept working too)
     from urllib.parse import quote
 except ImportError:                    # Python 2.7
     from urllib import quote
+
+
+# --- Compact (STUKI1) form ------------------------------------------------
+# base64url(raw-DEFLATE(JSON)), "STUKI1:" prefix.  This is byte-for-byte
+# what compact.rs + format.rs::to_compact() produce on the Rust side.
+import zlib
+
+STUKI_PREFIX = "STUKI1:"
+
+def _b64url_encode(data):
+    return (base64.b64encode(data).decode("ascii")
+            .rstrip("=").replace("+", "-").replace("/", "_"))
+
+def _b64url_decode(s):
+    # tolerate standard base64 and any missing padding too
+    s = s.rstrip("=").replace("-", "+").replace("_", "/")
+    return base64.b64decode(s + "=" * ((-len(s)) % 4))
+
+def _raw_deflate(data):                     # == miniz_oxide::deflate::compress_to_vec
+    c = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+    return c.compress(data) + c.flush()
+
+def _raw_inflate(data):                     # == compact::inflate
+    return zlib.decompress(data, -zlib.MAX_WBITS)
+
+
+def state_to_compact(state, prefix=STUKI_PREFIX):
+    """The web-Stuki state as one clipboard line: STUKI1: + b64url(deflate(json))."""
+    j = json.dumps(state, separators=(",", ":")).encode("utf-8")
+    return prefix + _b64url_encode(_raw_deflate(j))
+
+def compact_to_state(line, prefix=STUKI_PREFIX):
+    """Read it back (chat apps love wrapping long lines -> strip whitespace)."""
+    line = "".join(line.split())
+    if not line.startswith(prefix):
+        raise ValueError("not a %s line" % prefix)
+    return json.loads(_raw_inflate(_b64url_decode(line[len(prefix):])).decode("utf-8"))
+
+
+def csharp_source_to_compact(source):
+    return state_to_compact(csharp_source_to_state(source))
+    
 
 BASE62 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
@@ -816,22 +857,177 @@ public class Program
 """
 
 
-def main():
-    if len(sys.argv) > 1:
-        with io.open(sys.argv[1], "r", encoding="utf-8") as f:
-            source = f.read()
-    elif not sys.stdin.isatty():
-        source = sys.stdin.read()
-        if isinstance(source, bytes):
-            source = source.decode("utf-8")
-    else:
-        source = DEMO_SOURCE
-        print("(no input given, using built-in demo: Main + Fibonacci)\n", file=sys.stderr)
+# ---------------------------------------------------------------------------
+# Specification (speci) side - merged from str2speci.py
+#   URL     : <base>?data=<b64(gzip(JSON {"specification":..., "tests":[]}))>
+#   compact : SPECI1:<b64url(raw-deflate(spec text))>   (tests live in the text
+#             as a  /*--- test --- ... ---*/  block)
+# ---------------------------------------------------------------------------
 
-    url, state = csharp_source_to_url(source)
-    print("parsed %d method(s): " % len(state["structograms"])
-          + ", ".join(sg["name"] for sg in state["structograms"]), file=sys.stderr)
-    print(url)
+SPECI_PREFIX = "SPECI1:"
+SPECI_BASE = "https://progalap.elte.hu/specifikacio/v1/"
+STUKI_BASE = "https://progalap.elte.hu/stuki/v1/"
+
+
+def _to_text(s):
+    return s.decode("utf-8") if isinstance(s, bytes) else s
+
+
+def spec_to_url(spec_text, tests=None, base=SPECI_BASE):
+    payload = {"specification": _to_text(spec_text),
+               "tests": tests if tests is not None else []}
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    raw = raw.encode("utf-8") if not isinstance(raw, bytes) else raw
+    buf = io.BytesIO()
+    f = gzip.GzipFile(fileobj=buf, mode="wb", mtime=0)
+    try:
+        f.write(raw)
+    finally:
+        f.close()
+    blob = base64.b64encode(buf.getvalue()).decode("ascii")
+    return base + "?data=" + quote(blob, safe="")
+
+
+def spec_to_compact(spec_text):
+    return SPECI_PREFIX + _b64url_encode(_raw_deflate(_to_text(spec_text).encode("utf-8")))
+
+
+def compact_to_spec(line):
+    line = "".join(line.split())
+    if not line.startswith(SPECI_PREFIX):
+        raise ValueError("not a %s line" % SPECI_PREFIX)
+    return _raw_inflate(_b64url_decode(line[len(SPECI_PREFIX):])).decode("utf-8")
+
+
+def unescape(s):
+    r"""Interpret literal \n, \t and \\ (for when $'...' is not available)."""
+    out, i = [], 0
+    while i < len(s):
+        if s[i] == "\\" and i + 1 < len(s) and s[i + 1] in "nt\\":
+            out.append({"n": "\n", "t": "\t", "\\": "\\"}[s[i + 1]])
+            i += 2
+        else:
+            out.append(s[i])
+            i += 1
+    return "".join(out)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+HELP = """\
+speci_stuki.py - build progalap.elte.hu links (specification + structogram)
+
+DEFAULT: specification text -> specifikacio URL
+  speci_stuki.py 'Algoritmus:\\n  be: n\\n  ki: n'        (with -e, see below)
+  speci_stuki.py $'Algoritmus:\\n  be: n\\n  ki: négyzetgyök(n)'
+  speci_stuki.py < spec.txt            (or: echo "..." | speci_stuki.py)
+
+--convert [LINE]   turn an exported line into a URL (type is auto-detected):
+  SPECI1:...  -> specifikacio URL        STUKI1:...  -> stuki URL
+  The line may be an argument or on stdin; wrapped lines and a missing
+  prefix (STUKI1 assumed unless --speci is given) are tolerated.
+
+--cs [FILE]        C# method(s) -> stuki URL (FILE, or '-'/stdin if omitted)
+--dummy            C# -> stuki URL using the built-in demo (Main + Fibonacci)
+
+Options:
+  -e, --escape     interpret literal \\n \\t \\\\ in the spec string
+  --compact        print a SPECI1:/STUKI1: line instead of a URL
+  --both           print URL, then the compact line
+  --speci          with --convert: force specification type
+  -h, --help       this help
+
+Notes: a SPECI1: line carries the whole spec text (including any
+/*--- test ---*/ block); it is placed in the URL's "specification" field
+with an empty tests list.
+"""
+
+
+def emit(url, compact, both, mode_compact):
+    if compact:
+        print(mode_compact())
+    elif both:
+        print(url)
+        print(mode_compact())
+    else:
+        print(url)
+
+
+def read_stdin():
+    if sys.stdin.isatty():
+        return None
+    data = sys.stdin.read()
+    return _to_text(data)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args and sys.stdin.isatty():
+        sys.stdout.write(HELP)
+        return
+    flags = set(a for a in args if a in
+                ("-h", "--help", "-e", "--escape", "--compact", "--both",
+                 "--convert", "--speci", "--cs", "--dummy"))
+    pos = [a for a in args if a not in flags]
+    if "-h" in flags or "--help" in flags:
+        sys.stdout.write(HELP)
+        return
+    compact, both = "--compact" in flags, "--both" in flags
+
+    # --- --convert: exported line -> URL ---------------------------------
+    joined = "".join(pos).strip()
+    if "--convert" in flags or joined.startswith((SPECI_PREFIX, STUKI_PREFIX)):
+        line = joined or (read_stdin() or "")
+        line = "".join(line.split())
+        if not line:
+            raise SystemExit("--convert needs a SPECI1:/STUKI1: line (argument or stdin)")
+        if line.startswith(SPECI_PREFIX) or "--speci" in flags:
+            if not line.startswith(SPECI_PREFIX):
+                line = SPECI_PREFIX + line
+            spec = compact_to_spec(line)
+            print("parsed specification (%d chars)" % len(spec), file=sys.stderr)
+            print(spec_to_url(spec))
+        else:
+            if not line.startswith(STUKI_PREFIX):
+                line = STUKI_PREFIX + line
+            state = compact_to_state(line)
+            print("parsed %d method(s): " % len(state["structograms"])
+                  + ", ".join(sg["name"] for sg in state["structograms"]), file=sys.stderr)
+            print(state_to_url(state))
+        return
+
+    # --- C# -> stuki -------------------------------------------------------
+    if "--cs" in flags or "--dummy" in flags:
+        if "--dummy" in flags:
+            source = DEMO_SOURCE
+            print("(using built-in demo: Main + Fibonacci)", file=sys.stderr)
+        elif pos and pos[0] != "-":
+            with io.open(pos[0], "r", encoding="utf-8") as f:
+                source = f.read()
+        else:
+            source = read_stdin()
+            if source is None:
+                raise SystemExit("--cs needs a FILE or C# on stdin")
+        state = csharp_source_to_state(source)
+        print("parsed %d method(s): " % len(state["structograms"])
+              + ", ".join(sg["name"] for sg in state["structograms"]), file=sys.stderr)
+        emit(state_to_url(state), compact, both, lambda: state_to_compact(state))
+        return
+
+    # --- default: spec string -> speci URL ---------------------------------
+    if pos:
+        text = " ".join(pos) if len(pos) > 1 else pos[0]
+        text = _to_text(text)
+    else:
+        text = read_stdin()
+        if not text or not text.strip():
+            sys.stdout.write(HELP)
+            return
+    if "-e" in flags or "--escape" in flags:
+        text = unescape(text)
+    emit(spec_to_url(text), compact, both, lambda: spec_to_compact(text))
 
 
 if __name__ == "__main__":

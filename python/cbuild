@@ -345,8 +345,12 @@ def read_text(path):
         return data.decode('utf-8', 'replace')
 
 
-def load_unit(path, ctx, mark=True):
+def load_unit(path, ctx, mark=True, _stack=()):
     real = os.path.realpath(path)
+    if real in _stack:
+        ctx.warn('include cycle: {} (chain: {}) -- skipped'.format(
+            path, ' -> '.join(_stack + (real,))))
+        return None
     if real in ctx.visited:
         return None
     if mark:
@@ -432,7 +436,8 @@ def load_unit(path, ctx, mark=True):
                 if kind == '"' or ctx.inline_angle:
                     target = resolve(path, inc, kind, ctx)
                 if target:
-                    child = load_unit(target, ctx, mark=(cond == 0))
+                    child = load_unit(target, ctx, mark=(cond == 0),
+                                      _stack=_stack + (real,))
                     if child:
                         unit.incs.append((child, i + 1))
                         emit = ['\x01INC%d\x01' % (len(unit.incs) - 1)] + \
@@ -897,6 +902,7 @@ def find_entry(units, fn):
 
 
 def main():
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))
     ap = argparse.ArgumentParser(
         description=__doc__, prog='cbuild.py',
         formatter_class=argparse.RawDescriptionHelpFormatter)

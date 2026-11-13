@@ -86,4 +86,5 @@ alias gch='git checkout'
 
 export HISTCONTROL=erasedups:ignorespace
 export HISTIGNORE="clear:ls:ls *:exit:la:la *:cls:..:...:.. *:... *"
+export CC_x86_64_unknown_linux_musl="musl-gcc"
 

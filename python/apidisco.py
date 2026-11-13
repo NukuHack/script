@@ -86,6 +86,10 @@ class Findings:
         self.files = set()                   # interesting original source file names
         self.docs = []                       # (url, note)
         self.auth = {"logins": [], "bearer": None, "cookies": {}, "tokens": set()}  # from --har
+        self.bases = set()                   # same-origin axios/fetch baseURL literals, e.g. "/api"
+        self.checked = []                    # (url, status, note) every scanned/probed resource, hit or miss
+        self.schemas = {}                    # name -> {"kind","fields","used_by"} — dedup'd body/params/form shapes
+        self.har_stats = None                # diagnostic: how many HAR entries matched, and why
 
     def add(self, method, host, path, src, kind, score, extra=()):
         e = self.eps.setdefault((method, host, path), {"src": [], "kinds": set(), "score": 0, "extra": set()})
@@ -230,6 +234,8 @@ def scan(text, label, F, comments=True):
                     mm = METHOD_RE.search(text[max(0, qs - 150):end + 150])
                     if mm:
                         method = (mm.group(1) or mm.group(2)).upper()
+                    if not host and re.fullmatch(r'/[\w-]{1,24}', path):   # axios.create({baseURL:"/api"}) etc.
+                        F.bases.add(path.rstrip("/"))
         if ctx >= 2:                                           # parameter / body / multipart field names
             pm = re.search(r'\bparams\s*:\s*\{([^{}]{0,160})\}', after)
             if pm:
@@ -237,8 +243,10 @@ def scan(text, label, F, comments=True):
             bm = re.match(r'\s*,\s*\{([^{}]{1,200})\}', after)
             if bm:
                 keys = re.findall(r'(?:^|,)\s*([A-Za-z_$][\w$]*)\s*(?::|(?=,|$))', bm.group(1))
+                # for GET/DELETE/HEAD the 2nd arg is axios/fetch *config* (responseType, headers...), not a body
+                label = "config" if method in ("GET", "DELETE", "HEAD") else "body" if method in ("POST", "PUT", "PATCH") else "fields"
                 if keys and not {"method", "headers"} & set(keys):
-                    extra.append("body=" + ",".join(keys[:12]))
+                    extra.append(f"{label}=" + ",".join(keys[:12]))
             win = text[max(0, qs - 300):end + 300]
             if "FormData" in win:
                 fl = list(dict.fromkeys(re.findall(r'\.append\(\s*["\'](\w+)["\']', win)))
@@ -322,6 +330,8 @@ def add_observed(F, method, url, src):
     path = idify(path.split("?")[0])
     if host and host_is_noise(host):
         return
+    if host in PAGE_HOSTS:          # same origin as the page itself: unify with static findings, not a new host
+        host = ""
     F.add("WS" if url.startswith(("ws:", "wss:")) else method.upper(), host, path, src, "observed", 6)
 
 
@@ -363,12 +373,20 @@ def _token_fields(obj, prefix=""):
 def load_har(path, F):
     entries = json.load(open(path, encoding="utf-8"))["log"]["entries"]
     cookie_count, bearer_count, known_tokens = defaultdict(int), defaultdict(int), {}
+    rt_tally, matched, had_rt_field = defaultdict(int), 0, 0
 
     for e in entries:
-        r, rt = e["request"], e.get("_resourceType", "")
-        mime = e.get("response", {}).get("content", {}).get("mimeType", "")
-        if rt in ("fetch", "xhr", "websocket", "eventsource") or r["method"] != "GET" or "json" in mime:
+        r, rt = e["request"], e.get("_resourceType", "")       # Chrome-only field; "" on Firefox/other exporters
+        had_rt_field += "_resourceType" in e
+        rt_tally[rt or "(untagged)"] += 1
+        mime = (e.get("response", {}).get("content", {}).get("mimeType", "") or "").lower()
+        host, path = split_url(r["url"])
+        # fetch/xhr/ws tag (when present) or non-GET or json-ish mime or a /api/ path on a page host
+        # — that last clause is a safety net for exporters (Firefox etc.) that mislabel mime or drop the tag
+        looks_like_api = "/api/" in path.lower() and not STATIC_RE.search(path) and host in PAGE_HOSTS
+        if rt in ("fetch", "xhr", "websocket", "eventsource") or r["method"] != "GET" or "json" in mime or looks_like_api:
             add_observed(F, r["method"], r["url"], "HAR")
+            matched += 1
 
         for c in r.get("cookies", []):
             cookie_count[c["name"]] += 1
@@ -404,6 +422,8 @@ def load_har(path, F):
         F.auth["bearer"] = {"prefix": tok, "seen_on_requests": n,
                              "matches_login_response_field": known_tokens.get(tok)}
     F.auth["tokens"] = set(known_tokens.values())
+    F.har_stats = {"total": len(entries), "matched": matched, "by_resource_type": dict(rt_tally),
+                   "tagged_pct": round(100 * had_rt_field / len(entries), 1) if entries else 0}
 
 
 def browse(url, F, headers):
@@ -432,8 +452,15 @@ def probe(origin, http, F, baseline, queue):
     for path in PROBES:
         url = urljoin(origin + "/", path)
         st, ct, body = http.get(url)
-        if st != 200 or not body or body[:300] == baseline[:300]:   # skip SPA fallbacks
-            continue
+        if not st:
+            F.checked.append((url, "ERR", "no response / network error")); continue
+        if st != 200:
+            F.checked.append((url, st, "skip")); continue
+        if not body:
+            F.checked.append((url, st, "skip (empty body)")); continue
+        if body[:300] == baseline[:300]:
+            F.checked.append((url, st, "skip (SPA fallback, same as /)")); continue
+        F.checked.append((url, st, f"hit, {ct.split(';')[0] or 'unknown type'}"))
         F.docs.append((url, ct.split(";")[0]))
         if path.endswith("manifest.json"):
             queue += [urljoin(url, s) for s in re.findall(r'"([^"]+\.m?js)"', body)]
@@ -508,7 +535,10 @@ def discover(page, http, opts, F, extra_scripts=()):
             queue = []
             for u, status, text, smap in pool.map(work, batch):
                 if status != 200 or not text:
+                    F.checked.append((u, status or "ERR", "skip (not fetched / empty)"))
                     continue
+                note = f"scanned, {len(text) // 1024} KB" + (" +sourcemap" if smap else "")
+                F.checked.append((u, status, note))
                 if not opts.quiet:
                     print(f"  scanned {u} ({len(text) // 1024} KB){' +sourcemap' if smap else ''}", file=sys.stderr)
                 scan(text, u, F)
@@ -575,6 +605,68 @@ so a leaked token never gets sent to some third-party script's CDN.
 """
 
 
+def merge_bases(F):
+    """axios.create({baseURL:'/api'}) means a relative call to '/common/x' is really '/api/common/x'.
+    Where both forms were found (e.g. static scan sees the relative path, a HAR sees the real request),
+    merge them into one entry. Where only the relative one was found, just note the likely real path."""
+    if not F.bases:
+        return
+    for base in sorted(F.bases, key=len, reverse=True):
+        for (m, h, p) in list(F.eps):
+            if h or p.startswith(base + "/") or p == base:
+                continue
+            full = base + p
+            if (m, h, full) in F.eps:
+                src, dst = F.eps.pop((m, h, p)), F.eps[(m, h, full)]
+                dst["src"] = list(dict.fromkeys(dst["src"] + src["src"]))[:6]
+                dst["kinds"] |= src["kinds"]
+                dst["extra"] |= src["extra"]
+                dst["score"] = max(dst["score"], src["score"])
+            elif ("?", h, full) not in F.eps:
+                F.eps[(m, h, p)]["extra"].add(f"likely requested as {full} (baseURL '{base}' detected)")
+
+
+SCHEMA_SUFFIX = {"body": "Body", "params": "Params", "form": "Form", "config": "Config", "fields": "Fields"}
+
+
+def build_schemas(F, min_uses=2):
+    """Calls that send the same set of fields (the same request shape) get a shared, named type
+    instead of repeating the field list at every call site — e.g. 3 endpoints all sending
+    (taskID, file) become one 'TaskFileForm', referenced as 'form=TaskFileForm' at each one."""
+    sigs = {}   # (kind, fields) -> {"fields", "kind", "users": [(m,h,p), ...]}
+    refs = defaultdict(list)   # (m,h,p) -> [(raw_extra_str, sig_key), ...]
+    for key_mhp, e in F.eps.items():
+        for item in e["extra"]:
+            m_ = re.match(r'^(body|params|form|config|fields)=(.+)$', item)
+            if not m_:
+                continue
+            kind, fields = m_.group(1), tuple(m_.group(2).split(","))
+            sig_key = (kind, fields)
+            sigs.setdefault(sig_key, {"fields": fields, "kind": kind, "users": []})["users"].append(key_mhp)
+            refs[key_mhp].append((item, sig_key))
+
+    names, used = {}, set()
+    for sig_key, sig in sigs.items():
+        if len(sig["users"]) < min_uses:
+            continue
+        m, h, p = sig["users"][0]
+        seg = [s for s in p.split("?")[0].strip("/").split("/") if s and s != "{}"]
+        base = "".join(w.capitalize() for w in re.split(r"[-_]", seg[-1])) if seg else "Root"
+        name, n = base + SCHEMA_SUFFIX[sig["kind"]], 2
+        while name in used:
+            name, n = f"{base}{SCHEMA_SUFFIX[sig['kind']]}{n}", n + 1
+        used.add(name)
+        names[sig_key] = name
+        F.schemas[name] = {"kind": sig["kind"], "fields": list(sig["fields"]), "used_by": sig["users"]}
+
+    for key_mhp, items in refs.items():
+        e = F.eps[key_mhp]
+        for raw, sig_key in items:
+            if sig_key in names:
+                e["extra"].discard(raw)
+                e["extra"].add(f"{sig_key[0]}={names[sig_key]}")
+
+
 # ───────────────────────── report ─────────────────────────
 RANK = {"high": 0, "med": 1, "low": 2, "skip": 3}
 
@@ -605,6 +697,14 @@ def report(F, opts, page_hosts):
             print(f"[{c.upper():4}] {m:<6} {p}{extra}\n         {e['src'][0]}{more}  [{','.join(sorted(e['kinds']))}]")
             out.append({"host": h, "method": m, "path": p, "confidence": c, "kinds": sorted(e["kinds"]),
                         "sources": e["src"], "fields": sorted(e.get("extra", []))})
+    if F.har_stats:
+        s = F.har_stats
+        print(f"\n== HAR coverage ==")
+        print(f"  {s['total']} entries in the HAR, {s['matched']} treated as API calls "
+              f"({s['tagged_pct']}% had Chrome's _resourceType tag; {100 - s['tagged_pct']:.1f}% relied on "
+              f"mime-type/'/api/'-path fallback — if that's low and you're missing endpoints, this exporter "
+              f"doesn't tag requests, which is normal for Firefox).")
+        print("  by resource type: " + ", ".join(f"{k}={v}" for k, v in sorted(s["by_resource_type"].items(), key=lambda kv: -kv[1])))
     if F.auth["logins"] or F.auth["cookies"] or F.auth["bearer"]:
         print("\n== Login / session (from HAR) ==")
         for lg in F.auth["logins"]:
@@ -635,16 +735,49 @@ def report(F, opts, page_hosts):
         print("\n== Interesting original source files (from source maps) ==")
         for f in sorted(F.files):
             print("  " + f)
+    if F.schemas:
+        print("\n== Request shapes (reused across calls) ==")
+        for name, s in sorted(F.schemas.items()):
+            print(f"  {name}  ({s['kind']}: {', '.join(s['fields'])})")
+            for m, h, p in s["used_by"]:
+                print(f"      {m:<6} {(h or '') + p}")
     if F.comments:
         print("\n== Comments worth reading ==")
         for c, s in sorted(F.comments.items(), key=lambda x: sorted(x[1])[0]):
             print(f"  - {c}\n      {sorted(s)[0]}")
+    if F.checked:
+        hits = [(u, s, n) for u, s, n in F.checked if isinstance(s, int) and s == 200 and "skip" not in n]
+        skips = [(u, s, n) for u, s, n in F.checked if (u, s, n) not in hits]
+        print(f"\n== Resources checked ({len(F.checked)} total: {len(hits)} scanned, {len(skips)} skipped) ==")
+        if opts.verbose:
+            for u, s, n in F.checked:
+                print(f"  [{s}] {u}  - {n}")
+        else:
+            for u, s, n in hits[:15]:
+                print(f"  [{s}] {u}  - {n}")
+            if len(hits) > 15:
+                print(f"  ... +{len(hits) - 15} more scanned (use --verbose to list all, scanned and skipped)")
+            if skips:
+                by_reason = defaultdict(int)
+                for _, _, n in skips:
+                    by_reason[n.split("(")[0].strip()] += 1
+                print("  skipped: " + ", ".join(f"{n} x{c}" for n, c in sorted(by_reason.items())))
     print(f"\n{len(out)} endpoints, {len(F.comments)} comments, {len(F.gql)} graphql ops.")
     if opts.json:
         json.dump({"endpoints": out, "comments": {k: sorted(v) for k, v in F.comments.items()},
                    "graphql": {k: sorted(v) for k, v in F.gql.items()}, "source_files": sorted(F.files),
-                   "docs": F.docs}, open(opts.json, "w"), indent=2)
+                   "docs": F.docs, "checked": F.checked,
+                   "schemas": {n: {"kind": s["kind"], "fields": s["fields"],
+                                   "used_by": [{"method": m, "host": h, "path": p} for m, h, p in s["used_by"]]}
+                               for n, s in F.schemas.items()}},
+                  open(opts.json, "w"), indent=2)
         print(f"wrote {opts.json}")
+    if opts.out:
+        with open(opts.out, "w") as f:
+            for row in out:
+                host = row["host"] if row["host"] != "(same origin)" else ""
+                f.write(f"{row['method']}\t{host}{row['path']}\t{row['sources'][0]}\n")
+        print(f"wrote {opts.out} ({len(out)} endpoints)")
 
 
 def main():
@@ -658,9 +791,11 @@ def main():
     ap.add_argument("--vendor", action="store_true", help="also analyze node_modules in source maps")
     ap.add_argument("--max-files", type=int, default=300)
     ap.add_argument("--min", choices=["high", "med", "low"], default="low", help="minimum confidence shown")
-    ap.add_argument("--json", help="write full results to this file")
+    ap.add_argument("--json", help="write full results (everything in this report) to this file")
+    ap.add_argument("-o", "--out", help="write a plain METHOD/host+path/one-source-each list to this file")
     ap.add_argument("--insecure", action="store_true")
     ap.add_argument("-q", "--quiet", action="store_true")
+    ap.add_argument("-v", "--verbose", action="store_true", help="list every resource checked, not just a sample")
     opts = ap.parse_args()
     if opts.login_help:
         print(LOGIN_HELP)
@@ -671,6 +806,7 @@ def main():
     hdrs = dict(h.split(":", 1) for h in opts.header)
     hdrs = {k.strip(): v.strip() for k, v in hdrs.items()}
     hosts = {urlparse(u).netloc for u in opts.urls}
+    PAGE_HOSTS.update(hosts)    # so --browser / --har observed calls to the page's own host merge, not duplicate
     http, F = Http(hdrs, opts.insecure, hosts), Findings()
 
     for url in opts.urls:
@@ -680,6 +816,8 @@ def main():
         discover(url, http, opts, F, extra)
     if opts.har:
         load_har(opts.har, F)
+    merge_bases(F)
+    build_schemas(F)
     report(F, opts, hosts)
 
     if not opts.har and not hdrs:

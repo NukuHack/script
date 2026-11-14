@@ -43,6 +43,26 @@ class LoginError(ApiError):
     pass
 
 
+# print(..., e) crashes (UnicodeEncodeError/UnicodeDecodeError) the moment an exception's text
+# has a non-ASCII character -- a Hungarian IdP error page, an accented file name, etc. -- because
+# print() str()s its arguments with the ascii codec when stdout isn't a utf-8 tty (redirected to
+# a file/pipe, some remote/AFS terminals, python 2 generally). w() (elteui.render) already encodes
+# safely for the screen, so every print() in this file is routed through it instead.
+_print = print
+def print(*args, **kw):
+    try:
+        _print(*args, **kw)
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        sep, end = kw.get("sep", " "), kw.get("end", "\n")
+        parts = []
+        for a in args:
+            try:
+                parts.append(u"%s" % a)
+            except Exception:
+                parts.append(a.decode("utf-8", "replace") if isinstance(a, bytes) else repr(a))
+        w(sep.join(parts) + end)
+
+
 # ------------------------------------------------------------ config / cookies / log  (all in SITE)
 def load_cfg():
     CFG.update(SITE.read_json("cfg"))
@@ -435,6 +455,9 @@ def route(url):
     m = re.search(r"/courses/(\d+)/assignments/(\d+)", path)
     if m:
         return scr_assignment, (m.group(1), m.group(2))
+    m = re.search(r"/courses/(\d+)/quizzes/(\d+)", path)
+    if m:
+        return scr_quiz, (m.group(1), m.group(2))
     m = re.search(r"/files/(\d+)", path)
     if m:
         download_link(url, m.group(1))
@@ -531,8 +554,8 @@ def scr_course(cid):
     if enr.get("computed_current_score") is not None:
         s.add("Grade:    %s%%  %s" % (enr["computed_current_score"], enr.get("computed_current_grade") or ""))
     s.add("")
-    for label, func in (("assignments", scr_assignments), ("announcements", scr_announcements), ("modules", scr_modules),
-                        ("files", scr_files), ("pages", scr_pages)):
+    for label, func in (("assignments", scr_assignments), ("quizzes", scr_quizzes), ("announcements", scr_announcements),
+                        ("modules", scr_modules), ("files", scr_files), ("pages", scr_pages)):
         s.add(" %s %s" % (s.item("screen", func, cid), label))
     if c.get("syllabus_body"):
         s.add(" %s syllabus" % s.item("screen", scr_html, "Syllabus", c["syllabus_body"], BASE + "/courses/%s/assignments/syllabus" % cid, cid))
@@ -740,46 +763,16 @@ def scr_json(title, path):
 
 
 # ------------------------------------------------------------ upload
-def cmd_upload(cur, arg):
-    a = cur.ctx.get("assignment") if cur else None
-    cid = cur.ctx.get("cid") if cur else None
-    if not a:
-        print(" open an assignment first")
-        return
-    path = arg.strip() or ask_path(" File to upload (Tab completes): ")
-    path = os.path.expanduser(path.strip().strip("'\""))
-    if not path or not os.path.isfile(path):
-        print(" not a file: %s" % path)
-        return
+def upload_file_get_id(preflight_path, path):
+    """steps 1+2 of canvas's 3-step upload dance: ask canvas where to put the file, then send
+    it there, and hand back the resulting file id. shared by assignment submissions and quiz
+    file-upload questions -- only the preflight path and what you do with the id differ."""
     fname = os.path.basename(path)
     size = os.path.getsize(path)
-    st, when = when_text(a)
-    rule = "-" * max(20, term_size()[0] - 1)
-    print("\n" + rule)
-    print(" Upload  %s  (%s)" % (fname, hsize(size)))
-    print(" Task    %s" % a.get("name"))
-    print(" State   %s   %s" % (st, when))
-    if "online_upload" not in (a.get("submission_types") or []):
-        print(" WARNING this assignment does not accept file uploads (%s)" % ", ".join(a.get("submission_types") or []))
-    ext = [e.lower() for e in a.get("allowed_extensions") or []]
-    if ext and os.path.splitext(fname)[1].lstrip(".").lower() not in ext:
-        print(" WARNING allowed extensions: %s" % ", ".join(ext))
-    if st in ("CLOSED", "UPCOMING"):
-        print(" WARNING the assignment is %s; the server will probably reject this" % st)
-    if (a.get("submission") or {}).get("workflow_state") not in (None, "unsubmitted"):
-        print(" NOTE    you already have a submission; this creates a new attempt")
-    print(rule)
-    if not yes(" Upload now? [y/N] "):
-        print(" cancelled")
-        return
     ctype = mimetypes.guess_type(fname)[0] or "application/octet-stream"
-    base = "/api/v1/courses/%s/assignments/%s/submissions" % (cid, a.get("id"))
-    # step 1: ask canvas where to put the file
-    pre = api(base + "/self/files", "POST", [("name", fname), ("size", "%d" % size), ("content_type", ctype)])
+    pre = api(preflight_path, "POST", [("name", fname), ("size", "%d" % size), ("content_type", ctype)])
     if not isinstance(pre, dict) or not pre.get("upload_url"):
-        print(" unexpected response: %s" % fit("%s" % pre, 200))
-        return
-    # step 2: send the file to that url (fields from step 1 first, the file last)
+        raise ApiError("unexpected preflight response: %s" % fit("%s" % pre, 200))
     with open(path, "rb") as f:
         content = f.read()
     items = [("field", k, v) for k, v in (pre.get("upload_params") or {}).items()]
@@ -789,29 +782,340 @@ def cmd_upload(cur, arg):
     text = body_of(r)
     log("upload -> %s %s" % (r.getcode(), text[:1500]))
     if r.getcode() >= 400:
-        print(" upload failed: " + err_text(r.getcode(), text))
-        return
+        raise ApiError("upload failed: " + err_text(r.getcode(), text))
     try:
         fid = json.loads(re.sub(r"^\s*while\(1\);", "", text)).get("id")
     except Exception:
         fid = None
     if not fid:
-        print(" upload step did not return a file id: %s" % fit(text, 200))
+        raise ApiError("upload step did not return a file id: %s" % fit(text, 200))
+    return fid
+
+
+def cmd_upload(cur, arg):
+    """up <file[,file2,...]>  -- online_upload submission, one or several files at once"""
+    a = cur.ctx.get("assignment") if cur else None
+    cid = cur.ctx.get("cid") if cur else None
+    if not a:
+        print(" open an assignment first")
         return
-    # step 3: attach the file as a submission
-    sub = api(base, "POST", [("submission[submission_type]", "online_upload"), ("submission[file_ids][]", "%s" % fid)])
+    raw = arg.strip() or ask_path(" File to upload (Tab completes; comma-separate for several): ")
+    paths = [os.path.expanduser(p.strip().strip("'\"")) for p in raw.split(",")]
+    paths = [p for p in paths if p]
+    bad = [p for p in paths if not os.path.isfile(p)]
+    if not paths or bad:
+        print(" not a file: %s" % (bad[0] if bad else raw))
+        return
+    desc = ", ".join(os.path.basename(p) for p in paths)
+    st, when = when_text(a)
+    rule = "-" * max(20, term_size()[0] - 1)
+    print("\n" + rule)
+    print(" Upload  %s  (%s)" % (desc, hsize(sum(os.path.getsize(p) for p in paths))))
+    print(" Task    %s" % a.get("name"))
+    print(" State   %s   %s" % (st, when))
+    if "online_upload" not in (a.get("submission_types") or []):
+        print(" WARNING this assignment does not accept file uploads (%s)" % ", ".join(a.get("submission_types") or []))
+    ext = [e.lower() for e in a.get("allowed_extensions") or []]
+    if ext:
+        unmatched = [os.path.basename(p) for p in paths if os.path.splitext(p)[1].lstrip(".").lower() not in ext]
+        if unmatched:
+            print(" WARNING allowed extensions: %s  (not matched: %s)" % (", ".join(ext), ", ".join(unmatched)))
+    if st in ("CLOSED", "UPCOMING"):
+        print(" WARNING the assignment is %s; the server will probably reject this" % st)
+    if (a.get("submission") or {}).get("workflow_state") not in (None, "unsubmitted"):
+        print(" NOTE    you already have a submission; this creates a new attempt")
+    print(rule)
+    if not yes(" Upload now? [y/N] "):
+        print(" cancelled")
+        return
+    base = "/api/v1/courses/%s/assignments/%s/submissions" % (cid, a.get("id"))
+    try:
+        fids = [upload_file_get_id(base + "/self/files", p) for p in paths]
+    except ApiError as e:
+        print(" %s" % e)
+        return
+    fields = [("submission[submission_type]", "online_upload")] + [("submission[file_ids][]", "%s" % f) for f in fids]
+    sub = api(base, "POST", fields)
     print(" uploaded.")
     if isinstance(sub, dict):
         print("  status %s, attempt %s, submitted %s" % (sub.get("workflow_state"), sub.get("attempt"), fmt_dt(sub.get("submitted_at"))))
     go(scr_assignment, (cid, a.get("id")), push=False)
 
 
+def cmd_submit_text(cur, arg):
+    """uptext [text]  -- online_text_entry submission; with no text, opens a multi-line prompt"""
+    a = cur.ctx.get("assignment") if cur else None
+    cid = cur.ctx.get("cid") if cur else None
+    if not a:
+        print(" open an assignment first")
+        return
+    if "online_text_entry" not in (a.get("submission_types") or []):
+        print(" WARNING this assignment does not list online_text_entry (%s) -- trying anyway" % ", ".join(a.get("submission_types") or []))
+    body = arg.strip()
+    if not body:
+        print(" Type the submission text below, end with a single '.' on its own line:")
+        lines = []
+        while True:
+            try:
+                ln = input_()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if ln.strip() == ".":
+                break
+            lines.append(ln)
+        body = "\n".join(lines)
+    if not body.strip():
+        print(" empty, cancelled")
+        return
+    st, when = when_text(a)
+    print(" Task    %s" % a.get("name"))
+    print(" State   %s   %s" % (st, when))
+    if not yes(" Submit this text (%d chars) now? [y/N] " % len(body)):
+        print(" cancelled")
+        return
+    base = "/api/v1/courses/%s/assignments/%s/submissions" % (cid, a.get("id"))
+    sub = api(base, "POST", [("submission[submission_type]", "online_text_entry"), ("submission[body]", body)])
+    print(" submitted.")
+    if isinstance(sub, dict):
+        print("  status %s, attempt %s" % (sub.get("workflow_state"), sub.get("attempt")))
+    go(scr_assignment, (cid, a.get("id")), push=False)
+
+
+def cmd_submit_url(cur, arg):
+    """upurl <url>  -- online_url submission"""
+    a = cur.ctx.get("assignment") if cur else None
+    cid = cur.ctx.get("cid") if cur else None
+    if not a:
+        print(" open an assignment first")
+        return
+    url = arg.strip() or input_(" URL to submit: ").strip()
+    if not url:
+        print(" cancelled")
+        return
+    if "online_url" not in (a.get("submission_types") or []):
+        print(" WARNING this assignment does not list online_url (%s) -- trying anyway" % ", ".join(a.get("submission_types") or []))
+    if not yes(" Submit %s now? [y/N] " % url):
+        print(" cancelled")
+        return
+    base = "/api/v1/courses/%s/assignments/%s/submissions" % (cid, a.get("id"))
+    sub = api(base, "POST", [("submission[submission_type]", "online_url"), ("submission[url]", url)])
+    print(" submitted.")
+    if isinstance(sub, dict):
+        print("  status %s, attempt %s" % (sub.get("workflow_state"), sub.get("attempt")))
+    go(scr_assignment, (cid, a.get("id")), push=False)
+
+
+# ------------------------------------------------------------ quizzes (classic quiz API)
+def quiz_status(q):
+    if q.get("locked_for_user"):
+        return "LOCKED"
+    return (q.get("quiz_type") or "quiz").replace("_", " ")
+
+def scr_quizzes(cid):
+    lst = api("/api/v1/courses/%s/quizzes?per_page=100" % cid) or []
+    s = Screen("Quizzes", "list")
+    s.data = lst
+    s.ctx["cid"] = cid
+    s.add("## Quizzes (%d)" % len(lst), "")
+    namew = min(40, max([len(q.get("title", "")) for q in lst] + [10]))
+    for q in lst:
+        n = s.item("screen", scr_quiz, cid, q.get("id"))
+        due = ("due " + fmt_dt(q["due_at"], True) + " " + rel(q["due_at"])) if q.get("due_at") else "no due date"
+        s.add(" %s %-*s  %-16s %-26s  %s pts" % (n, namew, fit(q.get("title", "?"), namew),
+              quiz_status(q), due, fmtval(q.get("points_possible"))))
+    return s
+
+def scr_quiz(cid, qid):
+    q = api("/api/v1/courses/%s/quizzes/%s" % (cid, qid)) or {}
+    subs = []
+    try:
+        subs = (api("/api/v1/courses/%s/quizzes/%s/submissions" % (cid, qid)) or {}).get("quiz_submissions") or []
+    except ApiError:
+        pass
+    s = Screen("Quiz", "quiz")
+    s.data = q
+    s.ctx.update({"cid": cid, "quiz": q})
+    s.add("## %s" % q.get("title", "?"))
+    facts = []
+    if q.get("unlock_at"):
+        facts.append("available %s" % fmt_dt(q["unlock_at"]))
+    if q.get("due_at"):
+        facts.append("due %s" % fmt_dt(q["due_at"]))
+    if q.get("lock_at"):
+        facts.append("locks %s" % fmt_dt(q["lock_at"]))
+    if facts:
+        s.add("   ".join(facts))
+    allowed = q.get("allowed_attempts")
+    info = ["%s pts" % fmtval(q.get("points_possible")), "%s question(s)" % fmtval(q.get("question_count")),
+            "type: %s" % (q.get("quiz_type") or "-"),
+            "attempts: unlimited" if (allowed is None or allowed < 0) else "attempts: %s" % allowed]
+    if q.get("time_limit"):
+        info.append("time limit %s min" % q["time_limit"])
+    s.add("Info: " + ", ".join(info))
+    if q.get("locked_for_user"):
+        s.add("      LOCKED: %s" % md_to_text(q.get("lock_explanation") or ""))
+    if q.get("access_code"):
+        s.add("      NOTE access code required (not supported here)")
+    s.add("", "### Your attempts")
+    if subs:
+        for qs in subs:
+            s.add("  attempt %-4s %-10s score %s/%s" % (fmtval(qs.get("attempt")), qs.get("workflow_state") or "-",
+                  fmtval(qs.get("score")), fmtval(qs.get("quiz_points_possible") or q.get("points_possible"))))
+    else:
+        s.add("  no attempts yet")
+    if not q.get("locked_for_user"):
+        s.add("", "  take     start/resume this quiz")
+    if q.get("description"):
+        s.add("", "### Description")
+        add_html(s, q["description"], BASE + "/courses/%s/quizzes/%s" % (cid, qid))
+    return s
+
+def quiz_start_or_resume(cid, qid):
+    try:
+        subs = (api("/api/v1/courses/%s/quizzes/%s/submissions" % (cid, qid), "POST", []) or {}).get("quiz_submissions") or []
+        if subs:
+            return subs[0]
+    except ApiError:
+        pass
+    # starting failed (often because one is already open) -- look for an untaken attempt to resume
+    lst = api("/api/v1/courses/%s/quizzes/%s/submissions" % (cid, qid)) or {}
+    for qs in (lst.get("quiz_submissions") or []):
+        if qs.get("workflow_state") == "untaken":
+            return qs
+    raise ApiError("could not start or resume this quiz (already completed, attempts used up, or needs an access code)")
+
+def quiz_answer_prompt(qq):
+    """show one question, read an answer. returns (value, label) for the api call, or (None, None)
+    to skip. file_upload_question support is UNVERIFIED -- never exercised against a live Canvas,
+    the endpoint shape is a best guess from Canvas's public API docs; it may simply not work."""
+    qt = qq.get("question_type")
+    text = (md_to_text(qq.get("question_text") or "") or "(no question text)").strip()
+    print("\n " + text.replace("\n", "\n "))
+    answers = qq.get("answers") or []
+    if qt in ("multiple_choice_question", "true_false_question"):
+        for i, a in enumerate(answers, 1):
+            print("   [%d] %s" % (i, md_to_text(a.get("text") or a.get("html") or "")))
+        ans = input_(" answer (number, Enter to skip): ").strip()
+        if not ans:
+            return None, None
+        try:
+            a = answers[int(ans) - 1]
+            return a["id"], a.get("text")
+        except (ValueError, IndexError, KeyError):
+            print(" not a valid choice, skipping")
+            return None, None
+    if qt == "multiple_answers_question":
+        for i, a in enumerate(answers, 1):
+            print("   [%d] %s" % (i, md_to_text(a.get("text") or a.get("html") or "")))
+        ans = input_(" answers (comma-separated numbers, Enter to skip): ").strip()
+        if not ans:
+            return None, None
+        ids = []
+        for part in ans.split(","):
+            try:
+                ids.append(answers[int(part.strip()) - 1]["id"])
+            except (ValueError, IndexError):
+                pass
+        return (ids or None), ("%d selected" % len(ids))
+    if qt in ("essay_question", "short_answer_question"):
+        ans = input_(" answer (Enter to skip): ")
+        return (ans or None), ans
+    if qt == "numerical_question":
+        ans = input_(" numeric answer (Enter to skip): ").strip()
+        if not ans:
+            return None, None
+        try:
+            return float(ans), ans
+        except ValueError:
+            print(" not a number, skipping")
+            return None, None
+    if qt == "file_upload_question":
+        p = ask_path(" [UNVERIFIED] file for this question (Tab completes, Enter to skip): ").strip()
+        if not p:
+            return None, None
+        p = os.path.expanduser(p.strip().strip("'\""))
+        if not os.path.isfile(p):
+            print(" not a file: %s" % p)
+            return None, None
+        return ("__FILE__", p), os.path.basename(p)
+    print(" (question type '%s' isn't supported here, skipping)" % qt)
+    return None, None
+
+def cmd_take_quiz(cur, arg):
+    q = cur.ctx.get("quiz") if cur else None
+    cid = cur.ctx.get("cid") if cur else None
+    if not q:
+        print(" open a quiz first")
+        return
+    qid = q.get("id")
+    if q.get("locked_for_user"):
+        print(" LOCKED: %s" % md_to_text(q.get("lock_explanation") or ""))
+        return
+    rule = "-" * max(20, term_size()[0] - 1)
+    print("\n" + rule)
+    print(" Take quiz   %s" % q.get("title"))
+    print(" %s pts, %s question(s)%s" % (fmtval(q.get("points_possible")), fmtval(q.get("question_count")),
+          (", time limit %s min" % q["time_limit"]) if q.get("time_limit") else ""))
+    if q.get("access_code"):
+        print(" WARNING this quiz needs an access code, which this client has no prompt for")
+    print(rule)
+    if not yes(" Start / resume now? [y/N] "):
+        print(" cancelled")
+        return
+    try:
+        qs = quiz_start_or_resume(cid, qid)
+    except ApiError as e:
+        print(" %s" % e)
+        return
+    qsid, attempt, token = qs.get("id"), qs.get("attempt"), qs.get("validation_token")
+    try:
+        questions = (api("/api/v1/quiz_submissions/%s/questions" % qsid) or {}).get("quiz_submission_questions") or []
+    except ApiError as e:
+        print(" could not load questions: %s" % e)
+        return
+    print(" %d question(s). Enter skips a question for now; answered ones are saved as you go." % len(questions))
+    for i, qq in enumerate(questions, 1):
+        print("\n--- question %d/%d ---" % (i, len(questions)))
+        val, shown = quiz_answer_prompt(qq)
+        if val is None:
+            continue
+        fields = [("attempt", "%s" % attempt), ("validation_token", token), ("quiz_questions[][id]", "%s" % qq.get("id"))]
+        if isinstance(val, tuple) and val[0] == "__FILE__":
+            try:
+                fid = upload_file_get_id(
+                    "/api/v1/courses/%s/quizzes/%s/submissions/%s/questions/%s/files" % (cid, qid, qsid, qq.get("id")), val[1])
+            except ApiError as e:
+                print("  upload failed, skipping this question: %s" % e)
+                continue
+            fields.append(("quiz_questions[][answer]", "%s" % fid))
+        elif isinstance(val, list):
+            fields.extend(("quiz_questions[][answer][]", "%s" % v) for v in val)
+        else:
+            fields.append(("quiz_questions[][answer]", "%s" % val))
+        try:
+            api("/api/v1/quiz_submissions/%s/questions" % qsid, "POST", fields)
+            print("  saved.")
+        except ApiError as e:
+            print("  not saved: %s" % e)
+    if yes("\n Submit / finish the quiz now? [y/N] "):
+        try:
+            api("/api/v1/courses/%s/quizzes/%s/submissions/%s/complete" % (cid, qid, qsid), "POST",
+                [("attempt", "%s" % attempt), ("validation_token", token)])
+            print(" quiz submitted.")
+        except ApiError as e:
+            print(" could not finish: %s" % e)
+    else:
+        print(" left as a draft -- run 'take' again later to continue (if the server allows resuming).")
+    go(scr_quiz, (cid, qid), push=False)
+
+
 # ------------------------------------------------------------ main
 HINT = " <n> open   b back   r reload   h home   / search   raw   ? help   q quit"
 HINTS = {
     "home": " all = past courses   inbox   me   g <path> = any canvas page as text",
-    "course": " as = assignments   an = announcements   mod = modules   files   pages",
-    "task": " up <file> = upload   (files / links: type their number)",
+    "course": " as = assignments   qz = quizzes   an = announcements   mod = modules   files   pages",
+    "task": " up <file[,file2,..]>   uptext [..]   upurl <url>   (files / links: type their number)",
+    "quiz": " take  = start/resume this quiz",
 }
 
 HELP = [
@@ -827,12 +1131,18 @@ HELP = [
     "### Browse",
     "  all                         past courses",
     "  inbox                       messages",
-    "  as / an / mod / files / pages   inside a course: assignments, announcements, modules, files, pages",
+    "  as / qz / an / mod / files / pages   inside a course: assignments, quizzes, announcements, modules, files, pages",
     "  me                          your profile",
     "  g <path-or-url>             show any canvas page as text, e.g.  g /courses/123/grades",
     "",
     "### On an assignment",
-    "  up [file]                   upload a file (asks first)",
+    "  up [file[,file2,...]]       upload one or more files (online_upload; asks first)",
+    "  uptext [text]               submit text (online_text_entry); no text opens a multi-line prompt",
+    "  upurl [url]                 submit a URL (online_url)",
+    "",
+    "### On a quiz",
+    "  take                        start or resume taking the quiz, question by question",
+    "                              (file_upload questions are unverified -- never tested live)",
     "",
     "### Advanced",
     "  api <path>                  GET any API path, e.g.  api /api/v1/users/self/upcoming_events",
@@ -944,11 +1254,17 @@ def main():
             elif verb == "api" and arg:
                 p = arg.strip()
                 go(scr_json, ("GET " + p, p if p.startswith("/") else "/" + p))
-            elif cmd in ("as", "an", "mod", "files", "pages") and cid:
-                go({"as": scr_assignments, "an": scr_announcements, "mod": scr_modules,
-                    "files": scr_files, "pages": scr_pages}[cmd], (cid,))
+            elif cmd in ("as", "an", "mod", "files", "pages", "qz", "quiz", "quizzes") and cid:
+                go({"as": scr_assignments, "an": scr_announcements, "mod": scr_modules, "files": scr_files,
+                    "pages": scr_pages, "qz": scr_quizzes, "quiz": scr_quizzes, "quizzes": scr_quizzes}[cmd], (cid,))
             elif verb in ("up", "upload", "submit"):
                 cmd_upload(cur, arg)
+            elif verb == "uptext":
+                cmd_submit_text(cur, arg)
+            elif verb == "upurl":
+                cmd_submit_url(cur, arg)
+            elif verb == "take":
+                cmd_take_quiz(cur, arg)
             elif cmd == "relogin":
                 do_login()
                 go(scr_home)

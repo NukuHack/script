@@ -20,6 +20,10 @@ Options
                     -flag until the next cbuild option (or `--` / a
                     non-flag argument like a filename).  Repeatable:
                     -Xcc -O3 -std=c99 -g
+  -D NAME[=VAL]     Mark a macro as defined for #if folding (repeatable).
+                    This affects only merge-time constant folding; it does
+                    NOT get passed to the compiler (use -Xcc -DNAME=VAL).
+  -U NAME           Mark a macro as undefined for #if folding (repeatable).
 
 Merge options (same as merge_c.py)
 ----------------------------------
@@ -38,6 +42,10 @@ What merging does
 * Inlines local #include "..." files in place (first occurrence wins).
 * Hoists unconditional system includes / feature-test defines to the top.
 * Folds trivially constant #if 0 / #if 1 chains.
+* Folds #if/#ifdef/#ifndef/#elif/#else against the compiler's predefined
+  macros (discovered via `cc -E -dM -`) and any -D/-U the user passed.
+* Tracks #define/#undef for macros defined inside *fully resolvable*
+  conditional frames, so later #if defined(X) sees them.
 * Renames `static` functions defined in more than one file (<file>_<name>).
   Strings, comments and struct members are never touched.
 * --const-strings: conservative `char *` -> `const char *` fixes.
@@ -48,6 +56,7 @@ Examples
     cbuild.py -m app a.c b.c -Xcc -O3       # run app() instead of main()
     cbuild.py -c all.c a.c b.c -r           # just produce all.c (and a built temp)
     cbuild.py -c all.c -o prog -m app a.c b.c
+    cbuild.py -D MY_MEMCHECK a.c b.c        # treat MY_MEMCHECK as defined
     cbuild.py a.c -- arg1 arg2              # args passed to the program
 """
 
@@ -101,6 +110,41 @@ CONST_ARGS = {
     'sscanf': {0, 1}, 'fscanf': {1}, 'scanf': {0},
     'fwrite': {0}, 'write': {1}, 'send': {1},
 }
+
+
+# ------------------------------------------------------- predef discovery
+
+def get_predefined_macros(cc):
+    """Return {NAME: VALUE} for macros the target compiler predefines.
+
+    Uses `cc -E -dM -` (empty stdin).  Returns {} on any failure so the
+    merger silently falls back to conservative (never-fold) behaviour.
+    """
+    try:
+        p = subprocess.Popen(
+            [cc, '-E', '-dM', '-'],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        out, _err = p.communicate(b'')
+    except Exception:
+        return {}
+    if p.returncode != 0:
+        return {}
+    try:
+        text = out.decode('utf-8', 'replace')
+    except (LookupError, TypeError, AttributeError):
+        try:
+            text = out.decode('utf-8', 'replace')
+        except Exception:
+            return {}
+    macros = {}
+    for line in text.splitlines():
+        m = re.match(r'#define\s+(\w+)(\(([^)]*)\))?\s*(.*)', line)
+        if m:
+            macros[m.group(1)] = (m.group(4) or '').strip()
+    return macros
 
 
 # ------------------------------------------------------------ lexical helpers
@@ -304,20 +348,96 @@ class Ctx:
         self.sys_includes = []
         self.prelude = []
         self.warnings = 0
+        # --- macro tracking for #if folding
+        self.defined = {}       # NAME -> replacement text ('' for function-like)
+        self.predef_ok = False  # True only when we successfully got predefs
+        for d in getattr(args, 'define', None) or []:
+            if '=' in d:
+                k, v = d.split('=', 1)
+                self.defined[k] = v
+            else:
+                self.defined[d] = '1'
+        for u in getattr(args, 'undefine', None) or []:
+            self.defined.pop(u, None)
 
     def warn(self, msg):
         self.warnings += 1
         print("warning: " + msg, file=sys.stderr)
 
 
-def const_eval(expr):
+def const_eval(expr, ctx):
+    """Best-effort #if expression evaluator.
+
+    Returns True/False for provably constant expressions, None otherwise.
+    Handles ||, &&, !, parenthesised groups, defined(X), bare identifiers,
+    and the literals 0/1.
+    """
     e = expr.strip()
+
+    # || (lowest precedence)
+    parts = re.split(r'\|\|', e)
+    if len(parts) > 1:
+        vals = [const_eval(p, ctx) for p in parts]
+        if True in vals:
+            return True
+        if any(v is None for v in vals):
+            return None
+        return False
+
+    # &&
+    parts = re.split(r'&&', e)
+    if len(parts) > 1:
+        vals = [const_eval(p, ctx) for p in parts]
+        if False in vals:
+            return False
+        if any(v is None for v in vals):
+            return None
+        return True
+
+    # strip a single enclosing paren group
     while e.startswith('(') and e.endswith(')'):
-        e = e[1:-1].strip()
+        depth, single = 0, True
+        for i, c in enumerate(e):
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+                if depth == 0 and i < len(e) - 1:
+                    single = False
+                    break
+        if single:
+            e = e[1:-1].strip()
+        else:
+            break
+
+    # unary !
+    if e.startswith('!'):
+        v = const_eval(e[1:], ctx)
+        return None if v is None else (not v)
+
+    # defined(X) / defined X
+    m = re.match(r'defined\s*\(?\s*([A-Za-z_]\w*)\s*\)?$', e)
+    if m:
+        n = m.group(1)
+        if n in ctx.defined:
+            return True
+        return False if ctx.predef_ok else None
+
     if e == '0':
         return False
     if e == '1':
         return True
+
+    # bare identifier: look up its #define'd value
+    if re.match(r'[A-Za-z_]\w*$', e):
+        v = ctx.defined.get(e)
+        if v is None:
+            return None
+        try:
+            return bool(int(v, 0))
+        except (ValueError, TypeError):
+            return None
+
     return None
 
 
@@ -385,17 +505,31 @@ def load_unit(path, ctx, mark=True, _stack=()):
         name, rest = (dm.group(1), dm.group(2)) if dm else ('', '')
         emit = phys
 
+        # --- all conditionals folded when we can prove their truth value
         if name in ('if', 'ifdef', 'ifndef'):
             if dead_now:
                 stack.append(Frame(True, True, True, True))
                 emit = blank
             else:
-                c = const_eval(rest) if name == 'if' else None
+                c = None
+                if name == 'if':
+                    c = const_eval(rest, ctx)
+                elif name == 'ifdef':
+                    n = rest.strip()
+                    if re.match(r'[A-Za-z_]\w*$', n):
+                        c = (True if n in ctx.defined
+                             else (False if ctx.predef_ok else None))
+                else:   # ifndef
+                    n = rest.strip()
+                    if re.match(r'[A-Za-z_]\w*$', n):
+                        c = (False if n in ctx.defined
+                             else (True if ctx.predef_ok else None))
                 if c is None:
                     stack.append(Frame(False, False, False, False))
                 else:
                     stack.append(Frame(not c, c, True, False))
                     emit = blank
+
         elif name == 'elif' and stack:
             f = stack[-1]
             if f.parent_dead:
@@ -405,7 +539,7 @@ def load_unit(path, ctx, mark=True, _stack=()):
                     f.dead = True
                     emit = blank
                 else:
-                    c = const_eval(rest)
+                    c = const_eval(rest, ctx)
                     if c is None:
                         f.fold = False
                         f.dead = False
@@ -414,6 +548,7 @@ def load_unit(path, ctx, mark=True, _stack=()):
                     else:
                         f.dead, f.taken = (not c), c
                         emit = blank
+
         elif name == 'else' and stack:
             f = stack[-1]
             if f.parent_dead:
@@ -421,12 +556,15 @@ def load_unit(path, ctx, mark=True, _stack=()):
             elif f.fold:
                 f.dead = f.taken
                 emit = blank
+
         elif name == 'endif' and stack:
             f = stack.pop()
             if f.parent_dead or f.fold:
                 emit = blank
+
         elif dead_now:
             emit = blank
+
         elif name == 'include':
             cond = sum(1 for f in stack if not f.fold)
             mo = INCLUDE_RE.match(ojoined)
@@ -450,13 +588,36 @@ def load_unit(path, ctx, mark=True, _stack=()):
                             ctx.sys_includes.append(inc)
                         emit = blank
                 else:
-                    ctx.warn('cannot find include "{}" (from {}); left as is'.format(inc, path))
-        elif name == 'define' and PRELUDE_RE.match(mjoined) \
-                and not any(not f.fold for f in stack):
-            line = ojoined.strip()
-            if line not in ctx.prelude:
-                ctx.prelude.append(line)
-            emit = blank
+                    ctx.warn('cannot find include "{}" (from {}); left as is'
+                             .format(inc, path))
+
+        elif name == 'define':
+            # Track the macro when we're in a *fully resolvable* context
+            # (all frames so far are constant-foldable).  This lets later
+            # #if defined(X) see user-header-defined macros without us
+            # ever trusting a #define inside an unresolved conditional.
+            if not any(not f.fold for f in stack):
+                m2 = re.match(
+                    r'\s*#\s*define\s+([A-Za-z_]\w*)(\([^)]*\))?\s*(.*)',
+                    ojoined, re.S)
+                if m2:
+                    macro_name = m2.group(1)
+                    is_functionlike = m2.group(2) is not None
+                    value = (m2.group(3) or '').strip()
+                    ctx.defined[macro_name] = '' if is_functionlike else value
+            # Prelude defines get hoisted and blanked from the body.
+            if PRELUDE_RE.match(mjoined) and \
+                    not any(not f.fold for f in stack):
+                line = ojoined.strip()
+                if line not in ctx.prelude:
+                    ctx.prelude.append(line)
+                emit = blank
+
+        elif name == 'undef':
+            if not any(not f.fold for f in stack):
+                m2 = re.match(r'\s*#\s*undef\s+([A-Za-z_]\w*)', ojoined)
+                if m2:
+                    ctx.defined.pop(m2.group(1), None)
 
         out.extend((t, i + 1 + k) for k, t in enumerate(emit))
         i = j + 1
@@ -469,13 +630,13 @@ def load_unit(path, ctx, mark=True, _stack=()):
         if t is None:
             gap = True
             continue
-        blank = not t.strip()
-        if blank and prev_blank and (gap or not lines):
+        blank_ln = not t.strip()
+        if blank_ln and prev_blank and (gap or not lines):
             continue
         if ctx.use_line and no != last_no + 1:
             lines.append('\x02%d\x02' % no)
         lines.append(t)
-        prev_blank, gap, last_no = blank, False, no
+        prev_blank, gap, last_no = blank_ln, False, no
     unit.text = '\n'.join(lines)
     return unit
 
@@ -547,18 +708,18 @@ def esc(p):
 def render(unit, use_line):
     def repl(mo):
         child, lineno = unit.incs[int(mo.group(1))]
-        s = "/* ===== begin: {} ===== */\n".format(child.path)
+        s = "/* begin: {} */\n".format(child.path)
         if use_line:
             s += '#line 1 "{}"\n'.format(esc(child.path))
         s += render(child, use_line)
-        s += "\n/* ===== end: {} ===== */".format(child.path)
+        s += "\n/* end: {} */".format(child.path)
         if use_line:
             s += '\n#line {} "{}"'.format(lineno + 1, esc(unit.path))
         return s
     text = re.sub('\x02(\\d+)\x02',
                   lambda mo: '#line {} "{}"'.format(mo.group(1), esc(unit.path)),
                   unit.text)
-    return re.sub('\x01INC(\\d+)\x01', repl, text).strip('\n')
+    return re.sub('\x01INC(\\d+)\\x01', repl, text).strip('\n')
 
 
 # --------------------------------------------------- const char* conversion
@@ -770,7 +931,8 @@ def constify(text):
                 if any(pp.match(m[x:y]) for pp in CHAR_PARAMS):
                     edits.append(x + re.search(r'\bchar\b', m[x:y]).start())
             cands[('p', name, j)] = Cand(pm.group('n'), 1, f['body'], edits)
-            labels[('p', name, j)] = "parameter '{0}' of {1}()".format(pm.group('n'), name)
+            labels[('p', name, j)] = "parameter '{0}' of {1}()".format(
+                pm.group('n'), name)
 
     # ---- variables initialised with string literals
     for mo in DECL_LIT.finditer(m):
@@ -858,13 +1020,17 @@ def split_argv(argv):
         '-I', '--include-dir', '--inline-angle', '--no-rename',
         '--rename-all-static', '--const-strings', '--lang', '--line',
         '--dry-run', '--strict', '-Xcc',
+        '-D', '--define', '-U', '--undefine',
         '-main', '-out', '-combine', '-run',
         '-h', '--help',
     }
 
     def is_own(arg):
-        return arg in cbuild_opts or (
-            '=' in arg and arg.split('=', 1)[0] in cbuild_opts)
+        if arg in cbuild_opts:
+            return True
+        if '=' in arg and arg.split('=', 1)[0] in cbuild_opts:
+            return True
+        return False
 
     rest, xcc, i = [], [], 0
     while i < len(argv):
@@ -872,13 +1038,21 @@ def split_argv(argv):
         if a == '-Xcc':
             i += 1
             start = len(xcc)
-            # Slurp every -flag that isn't a cbuild option (or --foo=bar form).
             while (i < len(argv) and argv[i].startswith('-')
                    and not is_own(argv[i])):
                 xcc.append(argv[i])
                 i += 1
             if len(xcc) == start:
                 sys.exit("error: -Xcc requires at least one argument")
+            # Mirror attached-form -D/-U into the merger's view so folding
+            # agrees with what the compiler sees.
+            for arg in xcc[start:]:
+                if arg.startswith('-D') and len(arg) > 2:
+                    rest.append('-D')
+                    rest.append(arg[2:])
+                elif arg.startswith('-U') and len(arg) > 2:
+                    rest.append('-U')
+                    rest.append(arg[2:])
             continue
         rest.append(alias.get(a, a))
         i += 1
@@ -922,6 +1096,12 @@ def main():
     ap.add_argument('--line', action='store_true')
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--strict', action='store_true')
+    ap.add_argument('-D', '--define', action='append', default=[],
+                    metavar='NAME[=VAL]',
+                    help='predefine a macro for #if folding (repeatable)')
+    ap.add_argument('-U', '--undefine', action='append', default=[],
+                    metavar='NAME',
+                    help='mark a macro as undefined for #if folding')
     ap.add_argument('files', nargs='+')
 
     rest, xcc, prog_args = split_argv(sys.argv[1:])
@@ -937,6 +1117,21 @@ def main():
     entry = args.main if args.main and args.main != 'main' else None
 
     ctx = Ctx(args)
+
+    # Seed ctx.defined with the compiler's own predefs (so #ifdef _WIN32,
+    # #if defined(__GNUC__), etc. fold correctly) -- user -D/-U always win.
+    early_cc = os.environ.get('CC', 'gcc')
+    predef = get_predefined_macros(early_cc)
+    for k, v in predef.items():
+        ctx.defined.setdefault(k, v)
+    ctx.predef_ok = bool(predef)
+    if predef:
+        print("  predefs: {} macros known from {}"
+              .format(len(predef), early_cc), file=sys.stderr)
+    else:
+        print("  predefs: unavailable (folding #if/#ifdef conservatively)",
+              file=sys.stderr)
+
     roots = [u for u in (load_unit(f, ctx) for f in args.files) if u]
 
     driver = None

@@ -1,36 +1,20 @@
 #!/usr/bin/env python
-
-import subprocess
+import os
 import sys
-from pathlib import Path
+import subprocess
 
 def main():
-    # 1. Get the absolute path of the directory containing THIS script
-    # .resolve() ensures we get the absolute path, resolving any symlinks
-    script_dir = Path(__file__).parent.resolve()
-    
-    # 2. Define the path to the target script located next to this one
-    target_script = script_dir / "cbuild.py"
-    
-    # 3. Check if the target script actually exists
-    if not target_script.exists():
-        print(f"Error: Could not find '{target_script.name}' in {script_dir}")
-        sys.exit(1)
-    
-    # 4. Build the command
-    # sys.executable ensures it runs with the exact same Python interpreter 
-    # (e.g., if the user is inside a virtual environment)
-    command = [sys.executable, str(target_script)]
-    
-    # OPTIONAL: If you want to pass command-line arguments from this launcher 
-    # to the target script, uncomment the line below:
-    # command.extend(sys.argv[1:])
-    
-    # 5. Run the target script
-    result = subprocess.run(command)
-    
-    # 6. Exit with the exact same status code as the target script
-    sys.exit(result.returncode)
+    here = os.path.dirname(os.path.abspath(os.path.realpath(__file__)))
+    target = os.path.join(here, "cbuild.py")
+    if not os.path.isfile(target):
+        sys.stderr.write("error: %s not found in %s\n" %
+                         (os.path.basename(target), here))
+        return 1
+
+    argv = [sys.executable, target] + sys.argv[1:]
+    if os.name == "posix":
+        os.execv(sys.executable, argv)           # never returns
+    sys.exit(subprocess.call(argv))
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

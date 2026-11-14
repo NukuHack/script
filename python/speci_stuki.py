@@ -14,11 +14,15 @@ Scope / honesty about limits:
     algorithm" code (loops, ifs, switches, simple decls, simple I/O).
   - Supports: if/else if/else, while, do-while, for (desugared into an
     init statement + pre-test while + trailing increment), foreach
-    (rendered as a pre-test loop over the header text), switch/case/default,
-    break/continue as literal statements, local variable declarations
-    pulled into the "variables" box with real C# types, and a trailing
-    top-level `return` becomes the structogram's footer instead of a body
-    statement.
+    (rendered as a pre-test loop over `x in collection`, with x pulled
+    into the variables box), switch/case/default, break/continue as
+    literal statements, local variable declarations pulled into the
+    "variables" box with real C# types, and a trailing top-level `return`
+    becomes the structogram's footer instead of a body statement.
+  - try/catch/finally, using/lock/fixed, checked/unchecked/unsafe are
+    flattened: their block bodies become ordinary sequential statements
+    (the try/catch/lock/etc. semantics is lost, but no statements are
+    dropped and parsing stays honest).
   - I/O sugar: Console.WriteLine(...)/Console.Write(...) become "out ...";
     a bare Console.ReadLine()/Read()/ReadKey() or `x = Console.ReadLine();`
     become "inp" / "inp x". Wrapping conversions (int.Parse(...),
@@ -33,10 +37,19 @@ Scope / honesty about limits:
     another static helper, a static field) is not treated specially at all
     - it is simply kept verbatim as ordinary statement/condition text,
     which is the same fallback every unrecognized expression gets.
-  - Not supported: lambdas/LINQ, properties, try/catch, attributes,
-    nested local functions, multi-declarator statements with non-builtin
-    types (only the first initializer survives). Anything genuinely
-    unrecognized is kept as a literal statement line rather than crashing.
+  - Preprocessor directives #region/#endregion/#pragma/#nullable/#define/
+    #undef are stripped before parsing (they carry no algorithmic meaning);
+    #if/#else/#endif are kept so both sides of a conditional still appear.
+  - Not supported: lambdas/LINQ, properties, attributes, nested local
+    functions, multi-declarator statements with non-builtin types (only the
+    first initializer survives). Anything genuinely unrecognized is kept as
+    a literal statement line rather than crashing.
+
+Reverse direction (--decode): a progalap.elte.hu URL can be turned back into
+its content - a specifikacio URL gives back the exact specification text, a
+stuki URL gives back the structogram state as JSON (the original C# is not
+stored in the URL, so it cannot be restored).  Example:
+    speci_stuki.py --decode 'https://progalap.elte.hu/specifikacio/v1/?data=...'
 
 Usage: run with no arguments for the full help text. This file also builds
 progalap.elte.hu/specifikacio URLs from specification text (the old
@@ -51,18 +64,17 @@ import json
 import gzip
 import base64
 import random
+import zlib
 
 try:                                   # Python 3 (kept working too)
-    from urllib.parse import quote
+    from urllib.parse import quote, unquote
 except ImportError:                    # Python 2.7
-    from urllib import quote
+    from urllib import quote, unquote
 
 
 # --- Compact (STUKI1) form ------------------------------------------------
 # base64url(raw-DEFLATE(JSON)), "STUKI1:" prefix.  This is byte-for-byte
 # what compact.rs + format.rs::to_compact() produce on the Rust side.
-import zlib
-
 STUKI_PREFIX = "STUKI1:"
 
 def _b64url_encode(data):
@@ -97,7 +109,7 @@ def compact_to_state(line, prefix=STUKI_PREFIX):
 
 def csharp_source_to_compact(source):
     return state_to_compact(csharp_source_to_state(source))
-    
+
 
 BASE62 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
@@ -106,8 +118,19 @@ def rand_id(n=8):
     return "".join(random.choice(BASE62) for _ in range(n))
 
 
+# Preprocessor directives that carry no code (safe to drop before parsing).
+# We deliberately do NOT include #if/#else/#elif/#endif: those gate code that
+# should still be visible on both sides.
+PREPROCESSOR_RE = re.compile(
+    r"^[ \t]*#(?:region|endregion|pragma|nullable|define|undef)\b[^\n]*$",
+    re.MULTILINE,
+)
+
+
 def strip_comments(src):
-    """Remove // line comments and /* */ block comments (string/char aware)."""
+    """Remove // line comments, /* */ block comments, and preprocessor
+    directives that carry no algorithmic meaning.  String/char aware."""
+    src = PREPROCESSOR_RE.sub("", src)
     out = []
     i, n = 0, len(src)
     in_str = in_chr = False
@@ -443,6 +466,25 @@ class MethodBodyParser(object):
         if word == "switch":
             node, pos2 = self.parse_switch(s, pos, limit)
             return [node], pos2
+        if word in ("try", "catch", "finally"):
+            # Flatten try/catch/finally into one sequence of the try body, then
+            # each catch body, then the finally body.  Loses the exception
+            # routing, keeps every statement and keeps parsing sane.
+            return self._parse_try_chain(s, pos, limit, word)
+        if word in ("using", "lock", "fixed"):
+            # `<kw> (expr) stmt-or-block` -> flatten to just the body.
+            pos2 = pos + len(word)
+            pos2 = skip_ws(s, pos2, limit)
+            if pos2 < limit and s[pos2] == "(":
+                close = find_matching(s, pos2)
+                pos2 = skip_ws(s, close + 1, limit)
+            return self.parse_body(s, pos2, limit)
+        if word in ("checked", "unchecked", "unsafe"):
+            # `checked { ... }` is a block; `checked(expr)` is a statement.
+            pos2 = skip_ws(s, pos + len(word), limit)
+            if pos2 < limit and s[pos2] == "{":
+                return self.parse_body(s, pos2, limit)
+            # otherwise fall through to plain-statement handling
         if s[pos] == "{":
             close = find_matching(s, pos)
             return self.parse_statements(s, pos + 1, close), close + 1
@@ -468,6 +510,43 @@ class MethodBodyParser(object):
         if is_decl:
             return decl_items, new_pos
         return [{"kind": "stmt", "text": simplify_stmt(raw)}], new_pos
+
+    def _parse_try_chain(self, s, pos, limit, first_word):
+        """Flatten a try/catch/finally chain into one sequential item list."""
+        def parse_clause(p):
+            p += len(first_word) if first_word == peek_word(s, p) else 0
+            # (when called recursively for a catch/finally we pass the real word)
+            p = skip_ws(s, p, limit)
+            if p < limit and s[p] == "(":
+                close = find_matching(s, p)
+                p = skip_ws(s, close + 1, limit)
+            return self.parse_body(s, p, limit)
+
+        # First clause
+        p = pos
+        kw = peek_word(s, p)
+        p += len(kw)
+        p = skip_ws(s, p, limit)
+        if p < limit and s[p] == "(":
+            close = find_matching(s, p)
+            p = skip_ws(s, close + 1, limit)
+        items, p = self.parse_body(s, p, limit)
+        all_items = list(items)
+
+        # Trailing catch/finally clauses
+        while True:
+            p2 = skip_ws(s, p, limit)
+            nxt = peek_word(s, p2)
+            if nxt not in ("catch", "finally"):
+                break
+            p2 += len(nxt)
+            p2 = skip_ws(s, p2, limit)
+            if p2 < limit and s[p2] == "(":
+                close = find_matching(s, p2)
+                p2 = skip_ws(s, close + 1, limit)
+            more, p = self.parse_body(s, p2, limit)
+            all_items.extend(more)
+        return all_items, p
 
     def try_parse_declaration(self, raw):
         m = re.match(
@@ -571,7 +650,15 @@ class MethodBodyParser(object):
         pos += 7
         pos = skip_ws(s, pos, limit)
         close_paren = find_matching(s, pos)
-        header = simplify_cond(s[pos + 1:close_paren].strip())
+        header_raw = s[pos + 1:close_paren].strip()
+        # Pull the loop variable into the variables box, and render the
+        # structogram condition as `x in collection` (nicer than `var x in …`).
+        m = re.match(r"^(.+?)\s+([A-Za-z_]\w*)\s+in\s+(.+)$", header_raw, re.S)
+        if m:
+            self.add_variable(m.group(2), m.group(1).strip())
+            header = "%s in %s" % (m.group(2), simplify_cond(m.group(3).strip()))
+        else:
+            header = simplify_cond(header_raw)
         pos = skip_ws(s, close_paren + 1, limit)
         items, pos = self.parse_body(s, pos, limit)
         return {"kind": "while", "cond": header, "body": {"kind": "seq", "items": items}}, pos
@@ -813,17 +900,21 @@ def csharp_source_to_state(source):
     return state
 
 
-def state_to_url(state, base="https://progalap.elte.hu/stuki/v1/"):
-    json_str = json.dumps(state, separators=(",", ":"))
+def _gzip_b64_quoted(raw):
+    """bytes -> gzip (mtime=0, so output is deterministic) -> base64 -> %-encoded.
+    This is the `?data=` payload format used by both progalap.elte.hu apps."""
     buf = io.BytesIO()
     f = gzip.GzipFile(fileobj=buf, mode="wb", mtime=0)
     try:
-        f.write(json_str.encode("utf-8"))
+        f.write(raw)
     finally:
         f.close()
-    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-    encoded = quote(b64.encode("ascii"), safe="")
-    return base + "?data=" + encoded
+    return quote(base64.b64encode(buf.getvalue()).decode("ascii"), safe="")
+
+
+def state_to_url(state, base="https://progalap.elte.hu/stuki/v1/"):
+    json_str = json.dumps(state, separators=(",", ":"))
+    return base + "?data=" + _gzip_b64_quoted(json_str.encode("utf-8"))
 
 
 def csharp_source_to_url(source):
@@ -878,14 +969,7 @@ def spec_to_url(spec_text, tests=None, base=SPECI_BASE):
                "tests": tests if tests is not None else []}
     raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     raw = raw.encode("utf-8") if not isinstance(raw, bytes) else raw
-    buf = io.BytesIO()
-    f = gzip.GzipFile(fileobj=buf, mode="wb", mtime=0)
-    try:
-        f.write(raw)
-    finally:
-        f.close()
-    blob = base64.b64encode(buf.getvalue()).decode("ascii")
-    return base + "?data=" + quote(blob, safe="")
+    return base + "?data=" + _gzip_b64_quoted(raw)
 
 
 def spec_to_compact(spec_text):
@@ -897,6 +981,49 @@ def compact_to_spec(line):
     if not line.startswith(SPECI_PREFIX):
         raise ValueError("not a %s line" % SPECI_PREFIX)
     return _raw_inflate(_b64url_decode(line[len(SPECI_PREFIX):])).decode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# DECODE: URL -> original content  (the reverse of spec_to_url / state_to_url)
+#   specifikacio URL -> the exact specification text (+ its tests list)
+#   stuki URL        -> the structogram state (JSON).  The original C# source
+#                       is NOT stored in the URL, so it cannot be recovered;
+#                       the state is the closest "basic" form there is.
+# ---------------------------------------------------------------------------
+
+_DATA_PARAM_RE = re.compile(r"[?&]data=([^&#]*)")
+
+
+def url_to_payload(url):
+    """Decode a progalap.elte.hu `?data=` URL (or just the bare data blob)
+    into the JSON object it carries.  Tolerates line-wrapped URLs, a
+    missing scheme/host, url-safe base64 and missing '=' padding.
+    Raises ValueError if the text is not a decodable payload."""
+    url = "".join(_to_text(url).split())
+    m = _DATA_PARAM_RE.search(url)
+    blob = unquote(m.group(1) if m else url)
+    try:
+        raw = zlib.decompress(_b64url_decode(blob), 16 + zlib.MAX_WBITS)  # gzip
+        return json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        raise ValueError("could not decode URL data (%s: %s)" % (type(e).__name__, e))
+
+
+def url_to_spec(url):
+    """specifikacio URL -> (specification_text, tests_list)."""
+    payload = url_to_payload(url)
+    if not isinstance(payload, dict) or "specification" not in payload:
+        raise ValueError("this URL carries no specification "
+                         "(is it a stuki URL? then the result is a structogram state)")
+    return payload["specification"], payload.get("tests") or []
+
+
+def url_to_state(url):
+    """stuki URL -> structogram state dict (same shape csharp_source_to_state returns)."""
+    payload = url_to_payload(url)
+    if not isinstance(payload, dict) or "structograms" not in payload:
+        raise ValueError("this URL carries no structogram")
+    return payload
 
 
 def unescape(s):
@@ -929,6 +1056,14 @@ DEFAULT: specification text -> specifikacio URL
   The line may be an argument or on stdin; wrapped lines and a missing
   prefix (STUKI1 assumed unless --speci is given) are tolerated.
 
+--decode [URL]     the reverse: turn a progalap.elte.hu URL back into its content
+  specifikacio URL -> the original specification text
+  stuki URL        -> the structogram state as JSON (the C# source itself is
+                      not stored in the URL, so it cannot be restored)
+  The URL may be an argument or on stdin; wrapped lines are tolerated.
+  Combine with --compact for a SPECI1:/STUKI1: line, --json for raw JSON,
+  --both for text/JSON followed by the compact line.
+
 --cs [FILE]        C# method(s) -> stuki URL (FILE, or '-'/stdin if omitted)
 --dummy            C# -> stuki URL using the built-in demo (Main + Fibonacci)
 
@@ -937,6 +1072,7 @@ Options:
   --compact        print a SPECI1:/STUKI1: line instead of a URL
   --both           print URL, then the compact line
   --speci          with --convert: force specification type
+  --json           with --decode: print the raw decoded JSON payload
   -h, --help       this help
 
 Notes: a SPECI1: line carries the whole spec text (including any
@@ -955,6 +1091,13 @@ def emit(url, compact, both, mode_compact):
         print(url)
 
 
+def _print_text(text):
+    """print() that also copes with non-ASCII text on Python 2."""
+    if sys.version_info[0] == 2 and not isinstance(text, bytes):
+        text = text.encode("utf-8")
+    print(text)
+
+
 def read_stdin():
     if sys.stdin.isatty():
         return None
@@ -969,15 +1112,48 @@ def main():
         return
     flags = set(a for a in args if a in
                 ("-h", "--help", "-e", "--escape", "--compact", "--both",
-                 "--convert", "--speci", "--cs", "--dummy"))
+                 "--convert", "--speci", "--cs", "--dummy", "--decode", "--json"))
     pos = [a for a in args if a not in flags]
     if "-h" in flags or "--help" in flags:
         sys.stdout.write(HELP)
         return
     compact, both = "--compact" in flags, "--both" in flags
 
-    # --- --convert: exported line -> URL ---------------------------------
     joined = "".join(pos).strip()
+
+    # --- --decode: URL -> original content -------------------------------
+    if "--decode" in flags:
+        url = joined or (read_stdin() or "")
+        if not url.strip():
+            raise SystemExit("--decode needs a progalap.elte.hu URL (argument or stdin)")
+        try:
+            payload = url_to_payload(url)
+            if "--json" in flags:
+                _print_text(json.dumps(payload, indent=2, ensure_ascii=False))
+            elif isinstance(payload, dict) and "specification" in payload:
+                spec, tests = url_to_spec(url)
+                if tests:
+                    print("note: %d test(s) in the URL are not part of the plain text "
+                          "(use --json to see them)" % len(tests), file=sys.stderr)
+                if not compact:
+                    _print_text(spec)
+                if compact or both:
+                    print(spec_to_compact(spec))
+            elif isinstance(payload, dict) and "structograms" in payload:
+                state = url_to_state(url)
+                print("decoded %d method(s): " % len(state["structograms"])
+                      + ", ".join(sg["name"] for sg in state["structograms"]), file=sys.stderr)
+                if not compact:
+                    _print_text(json.dumps(state, indent=2, ensure_ascii=False))
+                if compact or both:
+                    print(state_to_compact(state))
+            else:
+                raise ValueError("unrecognised payload (neither specification nor structogram)")
+        except ValueError as e:
+            raise SystemExit("--decode: %s" % e)
+        return
+
+    # --- --convert: exported line -> URL ---------------------------------
     if "--convert" in flags or joined.startswith((SPECI_PREFIX, STUKI_PREFIX)):
         line = joined or (read_stdin() or "")
         line = "".join(line.split())

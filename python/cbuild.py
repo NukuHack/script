@@ -1,0 +1,1068 @@
+#!/usr/bin/env python
+"""
+cbuild.py -- merge C/C++ sources into ONE translation unit, compile it, run it.
+
+Pipeline (always in this order, one step):  combine -> compile -> run
+
+    cbuild.py [options] INPUT... [-- PROGRAM_ARGS...]
+
+Options
+-------
+  -m, -main FN      Entry function.  FN is never renamed by the merger.  If FN
+                    is not "main", every input's own main() is renamed out of
+                    the way (__unused_main_<i>__) and a driver
+                    `int main(void){ return FN(); }` is appended.
+  -o, -out EXE      Keep the executable here (default: temp file, deleted).
+  -c, -combine FILE Keep the merged source here (default: temp file, deleted).
+                    Extension .cpp/.cc/... makes the target C++.
+  -r, -run          Toggle: running is ON by default, passing -r turns it OFF.
+  -Xcc FLAG...      Extra compiler/linker flags.  Consumes every following
+                    -flag until the next cbuild option (or `--` / a
+                    non-flag argument like a filename).  Repeatable:
+                    -Xcc -O3 -std=c99 -g
+
+Merge options (same as merge_c.py)
+----------------------------------
+  -I, --include-dir DIR   extra include search dir
+  --inline-angle          also inline <...> includes found in an -I dir
+  --no-rename             do not rename colliding static functions
+  --rename-all-static     prefix every static function
+  --const-strings {auto,on,off}   char* -> const char* (C sources -> C++)
+  --lang {c,cpp}          target language (default: from -c ext / sources)
+  --line                  emit #line directives
+  --dry-run               merge only; write/compile/run nothing
+  --strict                exit non-zero if the merger warned
+
+What merging does
+-----------------
+* Inlines local #include "..." files in place (first occurrence wins).
+* Hoists unconditional system includes / feature-test defines to the top.
+* Folds trivially constant #if 0 / #if 1 chains.
+* Renames `static` functions defined in more than one file (<file>_<name>).
+  Strings, comments and struct members are never touched.
+* --const-strings: conservative `char *` -> `const char *` fixes.
+
+Examples
+--------
+    cbuild.py a.c b.c                       # merge, build, run (all temp)
+    cbuild.py -m app a.c b.c -Xcc -O3       # run app() instead of main()
+    cbuild.py -c all.c a.c b.c -r           # just produce all.c (and a built temp)
+    cbuild.py -c all.c -o prog -m app a.c b.c
+    cbuild.py a.c -- arg1 arg2              # args passed to the program
+"""
+
+from __future__ import print_function
+
+import sys
+import os
+import re
+import argparse
+import io
+import shutil
+import subprocess
+import tempfile
+
+# ------------------------------------------------------------------ constants
+
+NEVER_RENAME = {'main', 'wmain', 'WinMain', 'wWinMain'}
+
+CPP_EXTS = {'.cpp', '.cc', '.cxx', '.c++', '.hpp', '.hh', '.hxx', '.h++',
+            '.inl'}
+
+NOT_FUNCS = {
+    'if', 'while', 'for', 'switch', 'return', 'sizeof', 'do', 'else', 'case',
+    'typedef', 'struct', 'union', 'enum', 'defined', 'alignof', '_Alignof',
+    'catch', 'decltype',
+}
+
+INCLUDE_RE = re.compile(r'^\s*#\s*include\s*([<"])([^>"]+)[>"]')
+PRELUDE_RE = re.compile(
+    r'^\s*#\s*define\s+(?:_GNU_SOURCE|_[A-Z0-9_]*_SOURCE|WIN32_LEAN_AND_MEAN|'
+    r'NOMINMAX|_CRT_SECURE_NO_WARNINGS|UNICODE|_UNICODE|_WIN32_WINNT)\b')
+
+# Library functions whose arguments are `const`-qualified.
+#   set  -> those argument indexes
+#   int  -> every argument from that index on
+CONST_ARGS = {
+    'printf': 0, 'fprintf': 1, 'sprintf': 1, 'snprintf': 2, 'dprintf': 1,
+    'puts': {0}, 'fputs': {0}, 'perror': {0}, 'vprintf': {0},
+    'strlen': {0}, 'strcmp': {0, 1}, 'strncmp': {0, 1}, 'strcoll': {0, 1},
+    'strcasecmp': {0, 1}, 'strncasecmp': {0, 1},
+    'stricmp': {0, 1}, 'strnicmp': {0, 1},
+    'strcpy': {1}, 'strncpy': {1}, 'strcat': {1}, 'strncat': {1},
+    'strdup': {0}, 'strndup': {0}, 'memcmp': {0, 1}, 'memcpy': {1},
+    'memmove': {1},
+    'atoi': {0}, 'atol': {0}, 'atoll': {0}, 'atof': {0},
+    'strtol': {0}, 'strtoul': {0}, 'strtoll': {0}, 'strtoull': {0},
+    'strtod': {0}, 'strtof': {0},
+    'fopen': {0, 1}, 'freopen': {0, 1}, 'remove': {0}, 'rename': {0, 1},
+    'system': {0}, 'getenv': {0}, 'access': {0}, 'open': {0}, 'stat': {0},
+    'unlink': {0}, 'mkdir': {0}, 'chdir': {0}, 'opendir': {0},
+    'sscanf': {0, 1}, 'fscanf': {1}, 'scanf': {0},
+    'fwrite': {0}, 'write': {1}, 'send': {1},
+}
+
+
+# ------------------------------------------------------------ lexical helpers
+
+_LEX = re.compile('|'.join([
+    r'(?P<bc>/\*.*?\*/)',
+    r'(?P<lc>//(?:\\\n|[^\n])*)',
+    r'(?P<str>"(?:\\.|[^"\\\n])*")',
+    r"[A-Za-z_]\w*",
+    r"\d[\w.']*",                      # numbers incl. digit separators
+    r"(?P<chr>'(?:\\.|[^'\\\n])*')",
+]), re.S)
+
+
+def _blank(s):
+    return re.sub(r'[^\n]', ' ', s)
+
+
+def mask_cs(text):
+    """Blank comments and string/char literal contents (same length)."""
+    def f(mo):
+        g, s = mo.lastgroup, mo.group()
+        if g in ('bc', 'lc'):
+            return _blank(s)
+        if g == 'str':
+            return '"' + _blank(s[1:-1]) + '"'
+        if g == 'chr':
+            return "'" + _blank(s[1:-1]) + "'"
+        return s
+    return _LEX.sub(f, text)
+
+
+def _pp_line_flags(m):
+    flags, cont = [], False
+    for ln in m.split('\n'):
+        is_pp = cont or ln.lstrip().startswith('#')
+        cont = is_pp and ln.rstrip().endswith('\\')
+        flags.append(is_pp)
+    return flags
+
+
+def blank_pp(m):
+    """Blank preprocessor lines (incl. continuations)."""
+    lines = m.split('\n')
+    return '\n'.join(' ' * len(l) if f else l
+                     for l, f in zip(lines, _pp_line_flags(m)))
+
+
+def only_pp(m):
+    """Keep only preprocessor lines."""
+    lines = m.split('\n')
+    return '\n'.join(l if f else ' ' * len(l)
+                     for l, f in zip(lines, _pp_line_flags(m)))
+
+
+def match_fwd(m, i, o, c):
+    d = 0
+    for k in range(i, len(m)):
+        ch = m[k]
+        if ch == o:
+            d += 1
+        elif ch == c:
+            d -= 1
+            if d == 0:
+                return k
+    return -1
+
+
+def match_back(m, j, o='(', c=')'):
+    d = 0
+    for k in range(j, -1, -1):
+        ch = m[k]
+        if ch == c:
+            d += 1
+        elif ch == o:
+            d -= 1
+            if d == 0:
+                return k
+    return -1
+
+
+def skip_ws(m, i):
+    n = len(m)
+    while i < n and m[i].isspace():
+        i += 1
+    return i
+
+
+def prev_ws(m, i):
+    i -= 1
+    while i >= 0 and m[i].isspace():
+        i -= 1
+    return i
+
+
+def split_params(m, a, b):
+    spans, depth, start = [], 0, a
+    for i in range(a, b):
+        c = m[i]
+        if c in '([{':
+            depth += 1
+        elif c in ')]}':
+            depth -= 1
+        elif c == ',' and depth == 0:
+            spans.append((start, i))
+            start = i + 1
+    spans.append((start, b))
+    if len(spans) == 1 and m[a:b].strip() in ('', 'void'):
+        return []
+    return spans
+
+
+# ------------------------------------------------- top-level function scanner
+
+_NEXT = re.compile(r'[{};]')
+
+
+def _fn_head(m, stmt, end):
+    """If m[stmt:end] looks like `<type> name(params)` return info."""
+    j = end - 1
+    while j >= stmt and m[j].isspace():
+        j -= 1
+    if j < stmt or m[j] != ')':
+        return None
+    op = match_back(m, j)
+    if op < stmt:
+        return None
+    mm = re.search(r'([A-Za-z_]\w*)\s*$', m[stmt:op])
+    if not mm:
+        return None
+    name = mm.group(1)
+    prefix = m[stmt:stmt + mm.start(1)]
+    if name in NOT_FUNCS or '=' in prefix or re.search(r'\btypedef\b', prefix):
+        return None
+    return dict(name=name,
+                name_span=(stmt + mm.start(1), stmt + mm.end(1)),
+                static=bool(re.search(r'\bstatic\b', prefix)),
+                params=(op + 1, j),
+                prefix=prefix)
+
+
+def scan_top_level(m):
+    """Return (function defs, prototypes, struct-body spans) found at brace depth 0.
+    `m` must be comment/string/preprocessor-blanked."""
+    funcs, protos, members = [], [], []
+    i, stmt, n = 0, 0, len(m)
+    while i < n:
+        mo = _NEXT.search(m, i)
+        if not mo:
+            break
+        i, c = mo.start(), mo.group()
+        if c == '{':
+            close = match_fwd(m, i, '{', '}')
+            if close < 0:
+                break
+            fn = _fn_head(m, stmt, i)
+            if fn:
+                fn['body'] = (i, close)
+                funcs.append(fn)
+                stmt = close + 1
+            elif '=' not in m[stmt:i] and \
+                    re.search(r'\b(?:struct|union|enum|class)\b', m[stmt:i]):
+                members.append((i, close))
+            i = close + 1
+        elif c == ';':
+            fn = _fn_head(m, stmt, i)
+            if fn and fn['prefix'].strip():
+                protos.append(fn)
+            stmt = i + 1
+            i += 1
+        else:                       # stray '}'
+            stmt = i + 1
+            i += 1
+    return funcs, protos, members
+
+
+# ------------------------------------------------------------------- loading
+
+class Frame:
+    __slots__ = ('dead', 'taken', 'fold', 'parent_dead')
+
+    def __init__(self, dead, taken, fold, parent_dead):
+        self.dead, self.taken, self.fold = dead, taken, fold
+        self.parent_dead = parent_dead
+
+
+class Unit:
+    def __init__(self, path):
+        self.path = path
+        self.text = ''
+        self.incs = []          # [(child_unit, original_line_number)]
+
+
+class Ctx:
+    def __init__(self, args):
+        self.include_dirs = args.include_dir
+        self.inline_angle = args.inline_angle
+        self.use_line = args.line
+        self.visited = set()
+        self.units = []
+        self.sys_includes = []
+        self.prelude = []
+        self.warnings = 0
+
+    def warn(self, msg):
+        self.warnings += 1
+        print("warning: " + msg, file=sys.stderr)
+
+
+def const_eval(expr):
+    e = expr.strip()
+    while e.startswith('(') and e.endswith(')'):
+        e = e[1:-1].strip()
+    if e == '0':
+        return False
+    if e == '1':
+        return True
+    return None
+
+
+def resolve(cur_path, name, kind, ctx):
+    cands = []
+    if kind == '"':
+        d = os.path.dirname(cur_path)
+        cands.append(os.path.join(d, name) if d else name)
+    for d in ctx.include_dirs:
+        cands.append(os.path.join(d, name))
+    if kind == '"':
+        cands.append(name)
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def read_text(path):
+    with io.open(path, 'rb') as f:
+        data = f.read()
+    try:
+        return data.decode('utf-8', 'surrogateescape')
+    except (LookupError, TypeError):
+        return data.decode('utf-8', 'replace')
+
+
+def load_unit(path, ctx, mark=True, _stack=()):
+    real = os.path.realpath(path)
+    if real in _stack:
+        ctx.warn('include cycle: {} (chain: {}) -- skipped'.format(
+            path, ' -> '.join(_stack + (real,))))
+        return None
+    if real in ctx.visited:
+        return None
+    if mark:
+        ctx.visited.add(real)
+    try:
+        text = read_text(path)
+    except OSError as e:
+        ctx.warn("cannot read {}: {}".format(path, e))
+        return None
+
+    unit = Unit(path)
+    ctx.units.append(unit)
+    orig = text.split('\n')
+    masked = mask_cs(text).split('\n')
+    out, stack = [], []
+    i = 0
+    while i < len(orig):
+        dead_now = any(f.dead for f in stack)
+        if not masked[i].lstrip().startswith('#'):
+            out.append((None if dead_now else orig[i], i + 1))
+            i += 1
+            continue
+
+        j = i
+        while orig[j].rstrip().endswith('\\') and j + 1 < len(orig):
+            j += 1
+        phys = orig[i:j + 1]
+        blank = [None] * len(phys)
+        ojoined = ' '.join(l.rstrip('\\') for l in phys)
+        mjoined = ' '.join(l.rstrip('\\') for l in masked[i:j + 1])
+        dm = re.match(r'\s*#\s*(\w*)\s*(.*)', mjoined, re.S)
+        name, rest = (dm.group(1), dm.group(2)) if dm else ('', '')
+        emit = phys
+
+        if name in ('if', 'ifdef', 'ifndef'):
+            if dead_now:
+                stack.append(Frame(True, True, True, True))
+                emit = blank
+            else:
+                c = const_eval(rest) if name == 'if' else None
+                if c is None:
+                    stack.append(Frame(False, False, False, False))
+                else:
+                    stack.append(Frame(not c, c, True, False))
+                    emit = blank
+        elif name == 'elif' and stack:
+            f = stack[-1]
+            if f.parent_dead:
+                emit = blank
+            elif f.fold:
+                if f.taken:
+                    f.dead = True
+                    emit = blank
+                else:
+                    c = const_eval(rest)
+                    if c is None:
+                        f.fold = False
+                        f.dead = False
+                        new = re.sub(r'^\s*#\s*elif', '#if', ojoined, 1)
+                        emit = [new] + [None] * (len(phys) - 1)
+                    else:
+                        f.dead, f.taken = (not c), c
+                        emit = blank
+        elif name == 'else' and stack:
+            f = stack[-1]
+            if f.parent_dead:
+                emit = blank
+            elif f.fold:
+                f.dead = f.taken
+                emit = blank
+        elif name == 'endif' and stack:
+            f = stack.pop()
+            if f.parent_dead or f.fold:
+                emit = blank
+        elif dead_now:
+            emit = blank
+        elif name == 'include':
+            cond = sum(1 for f in stack if not f.fold)
+            mo = INCLUDE_RE.match(ojoined)
+            if mo:
+                kind, inc = mo.groups()
+                target = None
+                if kind == '"' or ctx.inline_angle:
+                    target = resolve(path, inc, kind, ctx)
+                if target:
+                    child = load_unit(target, ctx, mark=(cond == 0),
+                                      _stack=_stack + (real,))
+                    if child:
+                        unit.incs.append((child, i + 1))
+                        emit = ['\x01INC%d\x01' % (len(unit.incs) - 1)] + \
+                               [None] * (len(phys) - 1)
+                    else:
+                        emit = blank          # already included
+                elif kind == '<':
+                    if cond == 0:
+                        if inc not in ctx.sys_includes:
+                            ctx.sys_includes.append(inc)
+                        emit = blank
+                else:
+                    ctx.warn('cannot find include "{}" (from {}); left as is'.format(inc, path))
+        elif name == 'define' and PRELUDE_RE.match(mjoined) \
+                and not any(not f.fold for f in stack):
+            line = ojoined.strip()
+            if line not in ctx.prelude:
+                ctx.prelude.append(line)
+            emit = blank
+
+        out.extend((t, i + 1 + k) for k, t in enumerate(emit))
+        i = j + 1
+
+    # Drop removed lines entirely; strip leading blanks and collapse blank
+    # runs that removed lines left behind.  In --line mode, add a #line
+    # marker wherever the original numbering has a gap.
+    lines, prev_blank, gap, last_no = [], True, False, 0
+    for t, no in out:
+        if t is None:
+            gap = True
+            continue
+        blank = not t.strip()
+        if blank and prev_blank and (gap or not lines):
+            continue
+        if ctx.use_line and no != last_no + 1:
+            lines.append('\x02%d\x02' % no)
+        lines.append(t)
+        prev_blank, gap, last_no = blank, False, no
+    unit.text = '\n'.join(lines)
+    return unit
+
+
+# -------------------------------------------------------------------- rename
+
+def sanitize(name):
+    base = os.path.basename(name)
+    base = re.sub(r'\.[A-Za-z0-9+#]+$', '', base)
+    base = re.sub(r'[^A-Za-z0-9_]', '_', base) or 'file'
+    return '_' + base if base[0].isdigit() else base
+
+
+def apply_rename(text, cs, ren, skip_spans=()):
+    pieces, last = [], 0
+    for mo in re.finditer(r'(?<!\w)[A-Za-z_]\w*', cs):
+        new = ren.get(mo.group())
+        if not new:
+            continue
+        if any(a < mo.start() < b for a, b in skip_spans):
+            continue                       # struct/union/enum member name
+        p = prev_ws(cs, mo.start())
+        if p >= 0 and (cs[p] == '.' or (cs[p] == '>' and p > 0
+                                        and cs[p - 1] == '-')):
+            continue
+        pieces.append(text[last:mo.start()])
+        pieces.append(new)
+        last = mo.end()
+    pieces.append(text[last:])
+    return ''.join(pieces)
+
+
+def rename_statics(units, rename_all, keep=()):
+    defs, info = {}, {}
+    for u in units:
+        cs = mask_cs(u.text)
+        funcs, _, members = scan_top_level(blank_pp(cs))
+        info[id(u)] = (cs, funcs, members)
+        for f in funcs:
+            defs.setdefault(f['name'], set()).add(id(u))
+
+    used_prefix = {}
+    for u in units:
+        cs, funcs, members = info[id(u)]
+        pre = sanitize(u.path)
+        n = used_prefix.get(pre, 0)
+        used_prefix[pre] = n + 1
+        if n:
+            pre = "%s%d" % (pre, n)
+        ren = {}
+        for f in funcs:
+            nm = f['name']
+            if f['static'] and nm not in NEVER_RENAME and nm not in keep and \
+                    (rename_all or defs[nm] - {id(u)}):
+                ren[nm] = "{}_{}".format(pre, nm)
+        if ren:
+            u.text = apply_rename(u.text, cs, ren, members)
+            print("  renamed in {}: ".format(u.path)
+                  + ", ".join("{}->{}".format(k, v) for k, v in ren.items()),
+                  file=sys.stderr)
+
+
+# ------------------------------------------------------------------ assemble
+
+def esc(p):
+    return p.replace('\\', '/').replace('"', '\\"')
+
+
+def render(unit, use_line):
+    def repl(mo):
+        child, lineno = unit.incs[int(mo.group(1))]
+        s = "/* ===== begin: {} ===== */\n".format(child.path)
+        if use_line:
+            s += '#line 1 "{}"\n'.format(esc(child.path))
+        s += render(child, use_line)
+        s += "\n/* ===== end: {} ===== */".format(child.path)
+        if use_line:
+            s += '\n#line {} "{}"'.format(lineno + 1, esc(unit.path))
+        return s
+    text = re.sub('\x02(\\d+)\x02',
+                  lambda mo: '#line {} "{}"'.format(mo.group(1), esc(unit.path)),
+                  unit.text)
+    return re.sub('\x01INC(\\d+)\x01', repl, text).strip('\n')
+
+
+# --------------------------------------------------- const char* conversion
+
+ASSIGN = re.compile(r'(?:[-+*/%&|^]|<<|>>)?=(?!=)')
+CHAR_PARAMS = (
+    re.compile(r'^\s*(?:register\s+)?char\s*\*\s*(?P<n>[A-Za-z_]\w*)\s*$'),
+    re.compile(r'^\s*char\s+(?P<n>[A-Za-z_]\w*)\s*\[\s*\d*\s*\]\s*$'),
+)
+DECL_LIT = re.compile(
+    r'(?<![\w*])(?:(?:static|extern|register|auto)\s+)*(char)\s*\*\s*'
+    r'([A-Za-z_]\w*)\s*(\[\s*\d*\s*\])?\s*=')
+CALL_STOP = {'if', 'while', 'for', 'switch', 'return', 'sizeof', 'do', 'else'}
+
+
+class Cand:
+    def __init__(self, name, P, scope, edits, skip=(), is_global=False):
+        self.name, self.P, self.scope = name, P, scope
+        self.edits, self.skip, self.is_global = edits, set(skip), is_global
+        self.pat = re.compile(r'(?<!\w)' + re.escape(name) + r'(?!\w)')
+        self.argre = re.compile(
+            r'^\s*(?:&\s*)?(?:\*\s*)*' + re.escape(name) +
+            r'(?:\s*\[[^\]]*\])*(?:\s*[+-]\s*[\w.]+)?\s*$')
+
+
+def write_after(m, i):
+    n = len(m)
+    while i < n and (m[i].isspace() or m[i] == ')'):
+        i += 1
+    return bool(ASSIGN.match(m, i)) or m.startswith('++', i) \
+        or m.startswith('--', i)
+
+
+def enclosing_call(m, s):
+    depth, commas, i = 0, 0, s - 1
+    while i >= 0:
+        c = m[i]
+        if c in ')]}':
+            depth += 1
+        elif c in '([{':
+            if depth == 0:
+                if c != '(':
+                    return None
+                break
+            depth -= 1
+        elif c == ',' and depth == 0:
+            commas += 1
+        elif c == ';' and depth == 0:
+            return None
+        i -= 1
+    else:
+        return None
+    mm = re.search(r'([A-Za-z_]\w*)\s*$', m[max(0, i - 64):i])
+    if not mm or mm.group(1) in CALL_STOP:
+        return None
+    return mm.group(1), commas, i
+
+
+def occurrence_ok(m, s, e, c, accepts):
+    """Is this use of the candidate variable compatible with `const char`?"""
+    n, P = len(m), c.P
+    p = prev_ws(m, s)
+    if p >= 0 and (m[p] == '.' or (m[p] == '>' and p > 0 and m[p - 1] == '-')):
+        return True                                  # unrelated struct field
+    if re.search(r'sizeof\s*\(?\s*$', m[max(0, s - 30):s]):
+        return True
+
+    stars, q = 0, p
+    while q >= 0 and m[q] == '*':
+        stars += 1
+        q = prev_ws(m, q)
+    k, r = 0, e
+    while True:
+        r2 = skip_ws(m, r)
+        if r2 < n and m[r2] == '[':
+            cl = match_fwd(m, r2, '[', ']')
+            if cl < 0:
+                return False
+            k += 1
+            r = cl + 1
+        else:
+            r = r2
+            break
+    L = stars + k
+    lead = m[q] if q >= 0 else ''
+    lead2 = m[q - 1:q + 1] if q >= 1 else lead
+
+    addr = False
+    if lead == '&' and lead2 != '&&':
+        qq = prev_ws(m, q)
+        if not (qq >= 0 and (m[qq].isalnum() or m[qq] in '_)]')):
+            addr = True
+
+    ptrmod = False
+    if k == 0 and (m.startswith('++', r) or m.startswith('--', r)):
+        ptrmod = True
+        r = skip_ws(m, r + 2)
+
+    # --- access to the characters themselves: must be read-only
+    if L >= P and not addr:
+        if lead2 in ('++', '--'):
+            return False
+        return not write_after(m, r)
+
+    # --- otherwise this is a char* VALUE; check what it is used for
+    if addr:
+        if P != 1:
+            return False
+    elif P - L != 1:
+        return False
+
+    if not addr:
+        if ptrmod:
+            return lead in (';', '{', '}') and m[r:r + 1] in (';', ')')
+        if ASSIGN.match(m, r):
+            return True                          # (re)assigning the pointer
+    if lead == '!' or lead2 in ('&&', '||', '==', '!='):
+        return True
+    if m.startswith(('==', '!=', '&&', '||'), r):
+        return True
+    if lead == ';' and m[r:r + 1] == ';':
+        return True                                  # for (...; p; ...)
+    if lead == '(' and m[r:r + 1] == ')' and \
+            re.search(r'\b(?:if|while)\s*$', m[max(0, q - 10):q]):
+        return True
+
+    call = enclosing_call(m, s)
+    if call:
+        callee, argno, op = call
+        cl = match_fwd(m, op, '(', ')')
+        if cl >= 0:
+            spans = split_params(m, op + 1, cl)
+            if argno < len(spans):
+                a, b = spans[argno]
+                if c.argre.match(m[a:b]) and accepts(callee, argno):
+                    return True
+    return False
+
+
+def init_is_literal(m, start):
+    """Return True if the initializer starting at `start` is only string
+    literals (optionally NULL / ternaries / braces)."""
+    depth, i, n = 0, start, len(m)
+    while i < n:
+        ch = m[i]
+        if ch in '([{':
+            depth += 1
+        elif ch in ')]}':
+            if depth == 0:
+                return False
+            depth -= 1
+        elif depth == 0 and ch in ',;':
+            break
+        i += 1
+    else:
+        return False
+    if m[i] != ';':
+        return False                      # multi-declarator: skip
+    init = m[start:i]
+    if '"' not in init:
+        return False
+    if '?' in init:
+        init = init.split('?', 1)[1]      # condition may be anything
+    init = re.sub(r'\bNULL\b|\b0\b', '', init)
+    return re.match(r'\A[\s"?:(){},]*\Z', init) is not None
+
+
+def constify(text):
+    cs = mask_cs(text)
+    m = blank_pp(cs)
+    ppm = only_pp(cs)
+    funcs, protos, _members = scan_top_level(m)
+
+    sigs = {}
+    for f in funcs + protos:
+        a, b = f['params']
+        sigs.setdefault(f['name'], [m[x:y].strip()
+                                    for x, y in split_params(m, a, b)])
+
+    def all_refs_are_calls(name):
+        for mo in re.finditer(r'(?<!\w)' + re.escape(name) + r'(?!\w)', cs):
+            p = prev_ws(cs, mo.start())
+            if p >= 0 and (cs[p] == '.' or (cs[p] == '>' and cs[p - 1] == '-')):
+                continue
+            if cs[skip_ws(cs, mo.end()):][:1] != '(':
+                return False
+        return True
+
+    cands = {}
+    labels = {}
+
+    # ---- parameters
+    for f in funcs:
+        name = f['name']
+        if name in NEVER_RENAME or not all_refs_are_calls(name):
+            continue
+        spans = split_params(m, *f['params'])
+        for j, (a, b) in enumerate(spans):
+            pm = next((p.match(m[a:b]) for p in CHAR_PARAMS
+                       if p.match(m[a:b])), None)
+            if not pm:
+                continue
+            edits = []
+            for g in [f] + [p for p in protos if p['name'] == name]:
+                sp = split_params(m, *g['params'])
+                if len(sp) != len(spans):
+                    continue
+                x, y = sp[j]
+                if any(pp.match(m[x:y]) for pp in CHAR_PARAMS):
+                    edits.append(x + re.search(r'\bchar\b', m[x:y]).start())
+            cands[('p', name, j)] = Cand(pm.group('n'), 1, f['body'], edits)
+            labels[('p', name, j)] = "parameter '{0}' of {1}()".format(pm.group('n'), name)
+
+    # ---- variables initialised with string literals
+    for mo in DECL_LIT.finditer(m):
+        cpos = mo.start(1)
+        if re.search(r'\b(?:unsigned|signed|const)\s*$', m[:cpos]):
+            continue
+        if not init_is_literal(m, mo.end()):
+            continue
+        name = mo.group(2)
+        P = 2 if mo.group(3) else 1
+        body = next((f['body'] for f in funcs
+                     if f['body'][0] < cpos < f['body'][1]), None)
+        if body:
+            cands[('v', cpos)] = Cand(name, P, body, [cpos], [mo.start(2)])
+            labels[('v', cpos)] = "local '{}'".format(name)
+        else:
+            edits, skip = [cpos], [mo.start(2)]
+            for d in re.finditer(r'(?<![\w*])(char)\s*\*\s*([A-Za-z_]\w*)\s*'
+                                 r'(?:\[[^\]]*\])?\s*;', m):
+                if d.group(2) == name and not \
+                        re.search(r'\bconst\s*$', m[:d.start(1)]):
+                    edits.append(d.start(1))
+                    skip.append(d.start(2))
+            cands[('v', cpos)] = Cand(name, P, (0, len(m)), edits, skip, True)
+            labels[('v', cpos)] = "global '{}'".format(name)
+
+    failed = set()
+
+    def accepts(callee, j):
+        if callee in sigs:
+            ps = sigs[callee]
+            for idx, p in enumerate(ps):
+                if p == '...' and j >= idx:
+                    return True
+            if j < len(ps):
+                if re.match(r'const\s+(?:char|void)\s*\*(?!\s*\*)', ps[j]):
+                    return True
+                key = ('p', callee, j)
+                return key in cands and key not in failed
+            return False
+        spec = CONST_ARGS.get(callee)
+        if spec is None:
+            return False
+        return j >= spec if isinstance(spec, int) else j in spec
+
+    def cand_ok(c):
+        if c.is_global and re.search(r'(?<!\w)' + re.escape(c.name) +
+                                     r'(?!\w)', ppm):
+            return False
+        a, b = c.scope
+        for mo in c.pat.finditer(m, a, b):
+            if mo.start() in c.skip:
+                continue
+            if not occurrence_ok(m, mo.start(), mo.end(), c, accepts):
+                return False
+        return True
+
+    changed = True
+    while changed:
+        changed = False
+        for key, c in cands.items():
+            if key not in failed and not cand_ok(c):
+                failed.add(key)
+                changed = True
+
+    ok = [k for k in cands if k not in failed]
+    positions = sorted({p for k in ok for p in cands[k].edits}, reverse=True)
+    for p in positions:
+        text = text[:p] + 'const ' + text[p:]
+    return text, [labels[k] for k in ok], [labels[k] for k in cands
+                                           if k in failed]
+
+
+# ---------------------------------------------------------------------- main
+
+def split_argv(argv):
+    """Pull out `-Xcc FLAG...` and `-- PROG_ARGS`; map -main etc. aliases."""
+    prog_args = []
+    if '--' in argv:
+        k = argv.index('--')
+        argv, prog_args = argv[:k], argv[k + 1:]
+    alias = {'-main': '-m', '-out': '-o', '-combine': '-c', '-run': '-r'}
+    cbuild_opts = {
+        '-m', '--main', '-o', '--out', '-c', '--combine', '-r', '--run',
+        '-I', '--include-dir', '--inline-angle', '--no-rename',
+        '--rename-all-static', '--const-strings', '--lang', '--line',
+        '--dry-run', '--strict', '-Xcc',
+        '-main', '-out', '-combine', '-run',
+        '-h', '--help',
+    }
+
+    def is_own(arg):
+        return arg in cbuild_opts or (
+            '=' in arg and arg.split('=', 1)[0] in cbuild_opts)
+
+    rest, xcc, i = [], [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a == '-Xcc':
+            i += 1
+            start = len(xcc)
+            # Slurp every -flag that isn't a cbuild option (or --foo=bar form).
+            while (i < len(argv) and argv[i].startswith('-')
+                   and not is_own(argv[i])):
+                xcc.append(argv[i])
+                i += 1
+            if len(xcc) == start:
+                sys.exit("error: -Xcc requires at least one argument")
+            continue
+        rest.append(alias.get(a, a))
+        i += 1
+    return rest, xcc, prog_args
+
+
+def rename_mains(units):
+    for i, u in enumerate(units):
+        cs = mask_cs(u.text)
+        u.text = apply_rename(u.text, cs, {'main': '__unused_main_%d__' % i})
+
+
+def find_entry(units, fn):
+    for u in units:
+        funcs, _, _ = scan_top_level(blank_pp(mask_cs(u.text)))
+        for f in funcs:
+            if f['name'] == fn:
+                a, b = f['params']
+                return f, len(split_params(blank_pp(mask_cs(u.text)), a, b))
+    return None, 0
+
+
+def main():
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))
+    ap = argparse.ArgumentParser(
+        description=__doc__, prog='cbuild.py',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('-m', '--main', metavar='FN', help='entry function')
+    ap.add_argument('-o', '--out', metavar='EXE', help='keep executable here')
+    ap.add_argument('-c', '--combine', metavar='FILE',
+                    help='keep merged source here')
+    ap.add_argument('-r', '--run', dest='no_run', action='store_true',
+                    help='toggle: run is ON by default; pass to NOT run')
+    ap.add_argument('-I', '--include-dir', action='append', default=[])
+    ap.add_argument('--inline-angle', action='store_true')
+    ap.add_argument('--no-rename', action='store_true')
+    ap.add_argument('--rename-all-static', action='store_true')
+    ap.add_argument('--const-strings', choices=['auto', 'on', 'off'],
+                    default='auto')
+    ap.add_argument('--lang', choices=['c', 'cpp'], default=None)
+    ap.add_argument('--line', action='store_true')
+    ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--strict', action='store_true')
+    ap.add_argument('files', nargs='+')
+
+    rest, xcc, prog_args = split_argv(sys.argv[1:])
+    args = ap.parse_args(rest)
+
+    comb_real = os.path.realpath(args.combine) if args.combine else None
+    for f in args.files:
+        if not os.path.isfile(f):
+            sys.exit("error: {}: no such file".format(f))
+        if comb_real and os.path.realpath(f) == comb_real:
+            sys.exit("error: combine file {} is also an input".format(f))
+
+    entry = args.main if args.main and args.main != 'main' else None
+
+    ctx = Ctx(args)
+    roots = [u for u in (load_unit(f, ctx) for f in args.files) if u]
+
+    driver = None
+    if entry:
+        rename_mains(ctx.units)
+        fdef, nparams = find_entry(ctx.units, entry)
+        if not fdef:
+            sys.exit("error: entry function {}() not found".format(entry))
+        if nparams:
+            ctx.warn("{}() takes parameters; driver calls it with none"
+                     .format(entry))
+        pre = re.sub(r'\b(static|inline|extern|__inline__?|const)\b', '',
+                     fdef['prefix'])
+        is_void = bool(re.search(r'\bvoid\b', pre)) and '*' not in pre
+        call = ("    {}();\n    return 0;" if is_void
+                else "    return {}();").format(entry)
+        driver = ("/* ===== auto-generated driver: calls {0}() ===== */\n"
+                  "int main(void) {{\n{1}\n}}\n").format(entry, call)
+
+    if not args.no_rename:
+        rename_statics(ctx.units, args.rename_all_static,
+                       keep=(entry,) if entry else ())
+
+    src_cpp = any(os.path.splitext(u.path)[1].lower() in CPP_EXTS
+                  for u in ctx.units)
+    out_cpp = bool(args.combine) and \
+        os.path.splitext(args.combine)[1].lower() in CPP_EXTS
+    target = args.lang or ('cpp' if (out_cpp or src_cpp) else 'c')
+
+    body = []
+    for u in roots:
+        body.append("/* ===== begin: {} ===== */".format(u.path))
+        if args.line:
+            body.append('#line 1 "{}"'.format(esc(u.path)))
+        body.append(render(u, args.line))
+        body.append("/* ===== end: {} ===== */".format(u.path))
+        body.append("")
+    body_text = "\n".join(body)
+
+    do_const = args.const_strings == 'on' or (
+        args.const_strings == 'auto' and target == 'cpp' and not src_cpp)
+    if do_const:
+        body_text, changed, skipped = constify(body_text)
+        print("  const char*: {} converted, {} left unchanged".format(
+            len(changed), len(skipped)), file=sys.stderr)
+        for c in changed:
+            print("    + {}".format(c), file=sys.stderr)
+        for c in skipped:
+            print("    - {} (not provably read-only)".format(c),
+                  file=sys.stderr)
+
+    if driver:
+        if args.line:
+            body_text += '\n#line 1 "cbuild-driver"\n'
+        body_text += "\n" + driver
+
+    head = ["/* generated by cbuild.py ({}) */".format(target), ""]
+    if ctx.prelude:
+        for line in ctx.prelude:
+            dm = re.match(r'\s*#\s*define\s+(\w+)\s*$', line)
+            head += (["#ifndef {}".format(dm.group(1)), line, "#endif"]
+                     if dm else [line])
+        head.append("")
+    if ctx.sys_includes:
+        head += ["#include <{}>".format(i) for i in ctx.sys_includes] + [""]
+    content = "\n".join(head) + "\n" + body_text
+    if not content.endswith('\n'):
+        content += '\n'
+
+    if args.strict and ctx.warnings:
+        sys.exit(1)
+    if args.dry_run:
+        print("dry run: nothing written", file=sys.stderr)
+        return 0
+
+    try:
+        out_bytes = content.encode('utf-8', 'surrogateescape')
+    except (LookupError, TypeError):
+        out_bytes = content.encode('utf-8', 'replace')
+
+    tmp = tempfile.mkdtemp(prefix='cbuild_')
+    try:
+        ext = '.cpp' if target == 'cpp' else '.c'
+        csrc = args.combine or os.path.join(tmp, 'combined' + ext)
+        with io.open(csrc, 'wb') as f:
+            f.write(out_bytes)
+        if args.combine:
+            print("wrote {}".format(csrc), file=sys.stderr)
+
+        exe = args.out or os.path.join(tmp, 'a.out')
+        if target == 'cpp':
+            cc, lang = os.environ.get('CXX', 'g++'), 'c++'
+        else:
+            cc, lang = os.environ.get('CC', 'gcc'), 'c'
+        cmd = [cc, '-x', lang, csrc, '-o', exe,
+               '-W', '-Wall', '-Wextra', '-pedantic']
+        cmd += ['-I' + d for d in args.include_dir] + xcc + ['-lm']
+        print("Compiling {} -> {}".format(
+            csrc, args.out or "temp binary"), file=sys.stderr)
+        rc = subprocess.call(cmd)
+        if rc != 0:
+            print("error: compile failed ({})".format(rc), file=sys.stderr)
+            return rc
+        if args.out:
+            print("wrote {}".format(exe), file=sys.stderr)
+
+        if args.no_run:
+            return 0
+        exe_path = os.path.abspath(exe)
+        sys.stdout.flush()
+        return subprocess.call([exe_path] + prog_args)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        # Ctrl+C while the child program (or compiler) is running.
+        # subprocess.call() already reaps the child; main()'s finally
+        # block removes the temp dir.
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+        sys.stderr.write('\nclosed\n')
+        sys.stderr.flush()
+        sys.exit(130)

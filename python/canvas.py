@@ -6,7 +6,7 @@
 # Screens are built from the Canvas JSON API (/api/v1, session-cookie auth); any other
 # page can be shown as text with  g <path>.
 from __future__ import print_function
-import os, sys, re, json, time, getpass, mimetypes
+import os, sys, re, json, time, getpass, mimetypes, ssl
 from collections import OrderedDict
 
 try:
@@ -76,7 +76,50 @@ def save_cfg():
 log = SITE.log
 
 JAR = cookielib.LWPCookieJar(SITE.path("cookie"))
-OPENER = ur.build_opener(ur.HTTPCookieProcessor(JAR))
+
+# --- TLS: python 2.7 often can't verify the server certificate (old/missing CA bundle, or a server
+# that doesn't send its intermediate certificate). order of attempts:
+#   1. normal verification with the system store + a CA bundle we look for (CANVAS_CA=/path/file.pem to force one)
+#   2. if that fails and we have a terminal: ask once whether to continue WITHOUT verification
+#      (or set CANVAS_INSECURE=1 / run with --insecure to skip the question)
+CA_CANDIDATES = ["/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt",
+                 "/etc/ssl/ca-bundle.pem", "/etc/ssl/cert.pem", "/usr/local/etc/openssl/cert.pem"]
+INSECURE = bool(os.environ.get("CANVAS_INSECURE")) or "--insecure" in sys.argv
+if "--insecure" in sys.argv:
+    sys.argv.remove("--insecure")
+
+def make_ssl_context(insecure=False):
+    if insecure:
+        f = getattr(ssl, "_create_unverified_context", None)
+        return f() if f else None
+    if not hasattr(ssl, "create_default_context"):          # python < 2.7.9: no verification API at all
+        return None
+    ctx = ssl.create_default_context()
+    cafile = os.environ.get("CANVAS_CA") or os.environ.get("SSL_CERT_FILE")
+    if not cafile:
+        try:
+            import certifi
+            cafile = certifi.where()
+        except Exception:
+            for c in CA_CANDIDATES:
+                if os.path.isfile(c):
+                    cafile = c
+                    break
+    if cafile:
+        try:
+            ctx.load_verify_locations(cafile)
+        except Exception:
+            pass
+    return ctx
+
+def build_opener(insecure=False):
+    handlers = [ur.HTTPCookieProcessor(JAR)]
+    ctx = make_ssl_context(insecure)
+    if ctx is not None:
+        handlers.append(ur.HTTPSHandler(context=ctx))
+    return ur.build_opener(*handlers)
+
+OPENER = build_opener(INSECURE)
 
 def load_jar():
     try:
@@ -110,10 +153,25 @@ def open_url(url, data=None, headers=None, method=None, timeout=60):
         req.data = B(data)
     if method:
         req.get_method = lambda m=method: m
+    global OPENER, INSECURE
     try:
-        r = OPENER.open(req, timeout=timeout)
-    except ur.HTTPError as e:
-        r = e
+        try:
+            r = OPENER.open(req, timeout=timeout)
+        except ur.HTTPError as e:
+            r = e
+        except Exception as e:
+            if INSECURE or "CERTIFICATE_VERIFY_FAILED" not in ("%s" % e) or not sys.stdin.isatty():
+                raise
+            print("\nThe server certificate of %s could not be verified (%s)." % (HOST, e))
+            print("Usually this is an outdated CA list on this machine. Set CANVAS_CA=/path/to/ca.pem to fix it properly.")
+            if not yes("Continue WITHOUT certificate verification (your password is still encrypted, but the server is not authenticated)? [y/N] "):
+                raise
+            INSECURE = True
+            OPENER = build_opener(True)
+            try:
+                r = OPENER.open(req, timeout=timeout)
+            except ur.HTTPError as e2:
+                r = e2
     except Exception as e:
         raise ApiError("network error: %s" % e)
     save_jar()

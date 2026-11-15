@@ -33,6 +33,8 @@ Merge options (same as merge_c.py)
   --rename-all-static     prefix every static function
   --const-strings {auto,on,off}   char* -> const char* (C sources -> C++)
   --lang {c,cpp}          target language (default: from -c ext / sources)
+  --max-include-depth N   allow a file to re-include itself (via a cycle) up
+                          to N times before giving up (default 5)
   --line                  emit #line directives
   --dry-run               merge only; write/compile/run nothing
   --strict                exit non-zero if the merger warned
@@ -344,6 +346,9 @@ class Ctx:
         self.inline_angle = args.inline_angle
         self.use_line = args.line
         self.visited = set()
+        # how many times a file may appear in its own include chain
+        # (1 = never re-enter, i.e. the old behaviour)
+        self.max_reentry = max(1, getattr(args, 'max_include_depth', 5) or 5)
         self.units = []
         self.sys_includes = []
         self.prelude = []
@@ -351,6 +356,9 @@ class Ctx:
         # --- macro tracking for #if folding
         self.defined = {}       # NAME -> replacement text ('' for function-like)
         self.predef_ok = False  # True only when we successfully got predefs
+        # names (un)defined inside an unresolved conditional: their state is
+        # unknowable at merge time, so #if/#ifdef on them must not be folded
+        self.unknown = set()
         for d in getattr(args, 'define', None) or []:
             if '=' in d:
                 k, v = d.split('=', 1)
@@ -359,6 +367,14 @@ class Ctx:
                 self.defined[d] = '1'
         for u in getattr(args, 'undefine', None) or []:
             self.defined.pop(u, None)
+
+    def is_defined(self, n):
+        """True / False if provable, None if unknown."""
+        if n in self.unknown:
+            return None
+        if n in self.defined:
+            return True
+        return False if self.predef_ok else None
 
     def warn(self, msg):
         self.warnings += 1
@@ -410,6 +426,26 @@ def const_eval(expr, ctx):
         else:
             break
 
+    # simple numeric comparison:  A == 5, 3 < B, ...
+    m = re.match(r'(\w+)\s*(==|!=|<=|>=|<|>)\s*(\w+)$', e)
+    if m:
+        def num(tok):
+            if tok in ctx.unknown:
+                return None
+            if tok not in ctx.defined and not re.match(r'\d', tok):
+                return 0 if ctx.predef_ok and re.match(r'[A-Za-z_]', tok) \
+                    else None
+            v = tok if re.match(r'\d', tok) else ctx.defined[tok]
+            try:
+                return int(re.sub(r'[uUlL]+$', '', v.strip()), 0)
+            except (ValueError, TypeError):
+                return None
+        a, b = num(m.group(1)), num(m.group(3))
+        if a is None or b is None:
+            return None
+        return {'==': a == b, '!=': a != b, '<=': a <= b, '>=': a >= b,
+                '<': a < b, '>': a > b}[m.group(2)]
+
     # unary !
     if e.startswith('!'):
         v = const_eval(e[1:], ctx)
@@ -418,10 +454,7 @@ def const_eval(expr, ctx):
     # defined(X) / defined X
     m = re.match(r'defined\s*\(?\s*([A-Za-z_]\w*)\s*\)?$', e)
     if m:
-        n = m.group(1)
-        if n in ctx.defined:
-            return True
-        return False if ctx.predef_ok else None
+        return ctx.is_defined(m.group(1))
 
     if e == '0':
         return False
@@ -430,6 +463,8 @@ def const_eval(expr, ctx):
 
     # bare identifier: look up its #define'd value
     if re.match(r'[A-Za-z_]\w*$', e):
+        if e in ctx.unknown:
+            return None
         v = ctx.defined.get(e)
         if v is None:
             return None
@@ -467,11 +502,16 @@ def read_text(path):
 
 def load_unit(path, ctx, mark=True, _stack=()):
     real = os.path.realpath(path)
-    if real in _stack:
-        ctx.warn('include cycle: {} (chain: {}) -- skipped'.format(
-            path, ' -> '.join(_stack + (real,))))
+    depth = _stack.count(real)
+    if depth >= ctx.max_reentry:
+        ctx.warn('include cycle: {} re-entered {} times, giving up '
+                 '(chain: {}) -- skipped'.format(
+                     path, depth, ' -> '.join(_stack + (real,))))
         return None
-    if real in ctx.visited:
+    # A file already on the include stack may be re-entered (up to the
+    # limit): its #if guards usually flip (e.g. #undef MY_MEMCHECK) and
+    # end the loop.  Otherwise the usual "first occurrence wins" applies.
+    if depth == 0 and real in ctx.visited:
         return None
     if mark:
         ctx.visited.add(real)
@@ -517,13 +557,12 @@ def load_unit(path, ctx, mark=True, _stack=()):
                 elif name == 'ifdef':
                     n = rest.strip()
                     if re.match(r'[A-Za-z_]\w*$', n):
-                        c = (True if n in ctx.defined
-                             else (False if ctx.predef_ok else None))
+                        c = ctx.is_defined(n)
                 else:   # ifndef
                     n = rest.strip()
                     if re.match(r'[A-Za-z_]\w*$', n):
-                        c = (False if n in ctx.defined
-                             else (True if ctx.predef_ok else None))
+                        c = ctx.is_defined(n)
+                        c = None if c is None else (not c)
                 if c is None:
                     stack.append(Frame(False, False, False, False))
                 else:
@@ -605,6 +644,11 @@ def load_unit(path, ctx, mark=True, _stack=()):
                     is_functionlike = m2.group(2) is not None
                     value = (m2.group(3) or '').strip()
                     ctx.defined[macro_name] = '' if is_functionlike else value
+                    ctx.unknown.discard(macro_name)
+            else:
+                m2 = re.match(r'\s*#\s*define\s+([A-Za-z_]\w*)', ojoined)
+                if m2:
+                    ctx.unknown.add(m2.group(1))
             # Prelude defines get hoisted and blanked from the body.
             if PRELUDE_RE.match(mjoined) and \
                     not any(not f.fold for f in stack):
@@ -618,6 +662,11 @@ def load_unit(path, ctx, mark=True, _stack=()):
                 m2 = re.match(r'\s*#\s*undef\s+([A-Za-z_]\w*)', ojoined)
                 if m2:
                     ctx.defined.pop(m2.group(1), None)
+                    ctx.unknown.discard(m2.group(1))
+            else:
+                m2 = re.match(r'\s*#\s*undef\s+([A-Za-z_]\w*)', ojoined)
+                if m2:
+                    ctx.unknown.add(m2.group(1))
 
         out.extend((t, i + 1 + k) for k, t in enumerate(emit))
         i = j + 1
@@ -1019,7 +1068,7 @@ def split_argv(argv):
         '-m', '--main', '-o', '--out', '-c', '--combine', '-r', '--run',
         '-I', '--include-dir', '--inline-angle', '--no-rename',
         '--rename-all-static', '--const-strings', '--lang', '--line',
-        '--dry-run', '--strict', '-Xcc',
+        '--dry-run', '--strict', '-Xcc', '--max-include-depth',
         '-D', '--define', '-U', '--undefine',
         '-main', '-out', '-combine', '-run',
         '-h', '--help',
@@ -1093,6 +1142,10 @@ def main():
     ap.add_argument('--const-strings', choices=['auto', 'on', 'off'],
                     default='auto')
     ap.add_argument('--lang', choices=['c', 'cpp'], default=None)
+    ap.add_argument('--max-include-depth', type=int, default=5, metavar='N',
+                    help='how many times a file may appear in its own '
+                         'include chain before the cycle is cut (default 5; '
+                         '1 = never re-enter)')
     ap.add_argument('--line', action='store_true')
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--strict', action='store_true')
@@ -1105,7 +1158,11 @@ def main():
     ap.add_argument('files', nargs='+')
 
     rest, xcc, prog_args = split_argv(sys.argv[1:])
-    args = ap.parse_args(rest)
+    # files may appear before AND after options (a.c -m fn b.c -Xcc ...)
+    if hasattr(ap, 'parse_intermixed_args'):
+        args = ap.parse_intermixed_args(rest)
+    else:
+        args = ap.parse_args(rest)
 
     comb_real = os.path.realpath(args.combine) if args.combine else None
     for f in args.files:

@@ -11,7 +11,17 @@ Options
   -m, -main FN      Entry function.  FN is never renamed by the merger.  If FN
                     is not "main", every input's own main() is renamed out of
                     the way (__unused_main_<i>__) and a driver
-                    `int main(void){ return FN(); }` is appended.
+                    `int main(int argc, char **argv)` is appended that
+                    calls FN with arguments matched BY TYPE:
+                      int-like param  -> argc       (first one)
+                      char ** param   -> argv       (first one)
+                      char ** param   -> environ    (second one, envp)
+                      anything else   -> 0 (with a warning)
+                    So FN may be void(void), int(void), int(int, char**),
+                    void(char**, int), int(int, char*[], char*[]), ...
+                    An int-like return value becomes the exit status;
+                    other return types are discarded (exit status 0).
+                    Everything after `--` is the program's argv[1..].
   -o, -out EXE      Keep the executable here (default: temp file, deleted).
   -c, -combine FILE Keep the merged source here (default: temp file, deleted).
                     Extension .cpp/.cc/... makes the target C++.
@@ -60,6 +70,7 @@ Examples
     cbuild.py -c all.c -o prog -m app a.c b.c
     cbuild.py -D MY_MEMCHECK a.c b.c        # treat MY_MEMCHECK as defined
     cbuild.py a.c -- arg1 arg2              # args passed to the program
+    cbuild.py -m app a.c -- x y             # app(argc, argv) gets x y
 """
 
 from __future__ import print_function
@@ -1108,6 +1119,122 @@ def split_argv(argv):
     return rest, xcc, prog_args
 
 
+
+INT_TYPE_RE = re.compile(
+    r'\b(?:int|long|short|char|unsigned|signed|bool|_Bool|size_t|ssize_t|'
+    r'ptrdiff_t|intptr_t|uintptr_t|u?int\d+_t|u?int_(?:fast|least)\d+_t|'
+    r'DWORD|BOOL)\b')
+_QUALS_RE = re.compile(r'\b(?:static|inline|extern|__inline__?|__inline|'
+                       r'const|volatile|register|restrict|__restrict|'
+                       r'__restrict__|__extension__|constexpr|noexcept)\b')
+_KEYWORDS = {'char', 'int', 'long', 'short', 'unsigned', 'signed', 'const',
+             'void', 'float', 'double', 'bool', 'volatile', 'struct',
+             'union', 'enum', '_Bool', 'wchar_t'}
+
+
+def split_param(text):
+    """Split one masked parameter into (type_without_name, ptr_depth).
+
+    `char *argv[]` -> ('char **', 2);  `int argc` -> ('int', 0);
+    `const char *const *a` -> ('const char *const *', 2).
+    """
+    t = ' '.join(text.split())
+    arrays = re.search(r'((?:\s*\[[^\]]*\])*)\s*$', t).group(1)
+    core = t[:len(t) - len(arrays)].rstrip()
+    mo = re.match(r'^(.*?)([A-Za-z_]\w*)$', core)
+    if mo and mo.group(1).strip() and mo.group(2) not in _KEYWORDS and \
+            (mo.group(1).rstrip()[-1:] in '*' or ' ' in core or
+             re.search(r'\w\s*$', mo.group(1))):
+        # last identifier is the parameter name, unless it is just a
+        # type word (e.g. `unsigned` / `size_t` alone)
+        before = mo.group(1)
+        if before.strip() and not (INT_TYPE_RE.match(mo.group(2) + ' ')  and INT_TYPE_RE.match(mo.group(2)).end() == len(mo.group(2)) and
+                                   not re.search(r'\w|\*', before.strip()[-1:])):
+            if not re.match(r'\s*(?:const\s+|unsigned\s+|signed\s+)*\Z',
+                           before):
+                core = before.rstrip()
+    ty = core + ' *' * arrays.count('[')
+    return ty.strip(), ty.count('*')
+
+
+def build_driver(entry, fdef, m):
+    """Generate `int main(...)` that adapts to the entry's signature.
+
+    Understood parameter shapes (matched by type, names do not matter):
+      integer           -> argc    (first one; further ints get 0)
+      char **           -> argv    (first one)
+      char **           -> envp    (second one: the process environment)
+      anything else     -> 0 / NULL  (with a warning from the caller)
+    Return value: integer types become the exit status, void/other
+    types are discarded and the exit status is 0.
+    Returns (driver_text, warnings).
+    """
+    warns = []
+    a, b = fdef['params']
+    spans = split_params(m, a, b)
+    args, seen_argc, nptr2 = [], False, 0
+    for x, y in spans:
+        raw = m[x:y].strip()
+        if raw == '...':
+            continue
+        ty, depth = split_param(raw)
+        base = re.sub(r'[*&\s]+', ' ', _QUALS_RE.sub('', ty)).strip()
+        if depth == 0 and '&' not in raw and INT_TYPE_RE.search(ty) and \
+                'float' not in ty and 'double' not in ty:
+            if not seen_argc:
+                args.append('argc')
+                seen_argc = True
+            else:
+                args.append('0')
+                warns.append("parameter '{}' of {}() set to 0"
+                             .format(raw, entry))
+        elif depth == 2 and re.search(r'\bchar\b', ty) and \
+                'wchar' not in ty:
+            if nptr2 == 0:
+                args.append('({})argv'.format(ty))
+            elif nptr2 == 1:
+                args.append('({})CBUILD_ENVP'.format(ty))
+            else:
+                args.append('0')
+                warns.append("parameter '{}' of {}() set to NULL"
+                             .format(raw, entry))
+            nptr2 += 1
+        else:
+            args.append('0')
+            warns.append("don't know how to fill parameter '{}' of {}(); "
+                         "passing 0".format(raw, entry))
+    call = '{}({})'.format(entry, ', '.join(args))
+
+    pre = _QUALS_RE.sub('', fdef['prefix'])
+    pre = re.sub(r'__attribute__\s*\(\(.*?\)\)', '', pre)
+    pre = re.sub(r'"[^"]*"|\bextern\b', '', pre)
+    is_void = bool(re.search(r'\bvoid\b', pre)) and '*' not in pre
+    is_int = (not is_void and '*' not in pre and
+              INT_TYPE_RE.search(pre) is not None and
+              not re.search(r'\b(?:float|double)\b', pre))
+
+    uses = ' '.join(args)
+    lines = ['/* ===== auto-generated driver: calls {}() ===== */'
+             .format(entry)]
+    if 'CBUILD_ENVP' in uses:
+        lines += ['#ifdef _WIN32',
+                  '#include <stdlib.h>',
+                  '#define CBUILD_ENVP _environ',
+                  '#else',
+                  'extern char **environ;',
+                  '#define CBUILD_ENVP environ',
+                  '#endif']
+    lines.append('int main(int argc, char **argv) {')
+    lines.append('    (void)argc; (void)argv;')
+    if is_int:
+        lines.append('    return (int){};'.format(call))
+    else:
+        lines.append('    {};'.format(call))
+        lines.append('    return 0;')
+    lines.append('}')
+    return '\n'.join(lines) + '\n', warns
+
+
 def rename_mains(units):
     for i, u in enumerate(units):
         cs = mask_cs(u.text)
@@ -1115,13 +1242,15 @@ def rename_mains(units):
 
 
 def find_entry(units, fn):
+    """Return (function info, masked text it was found in) or (None, '')."""
     for u in units:
-        funcs, _, _ = scan_top_level(blank_pp(mask_cs(u.text)))
+        mt = blank_pp(mask_cs(u.text))
+        funcs, _, _ = scan_top_level(mt)
         for f in funcs:
             if f['name'] == fn:
-                a, b = f['params']
-                return f, len(split_params(blank_pp(mask_cs(u.text)), a, b))
-    return None, 0
+                return f, mt
+    return None, ''
+
 
 
 def main():
@@ -1194,19 +1323,12 @@ def main():
     driver = None
     if entry:
         rename_mains(ctx.units)
-        fdef, nparams = find_entry(ctx.units, entry)
+        fdef, mtext = find_entry(ctx.units, entry)
         if not fdef:
             sys.exit("error: entry function {}() not found".format(entry))
-        if nparams:
-            ctx.warn("{}() takes parameters; driver calls it with none"
-                     .format(entry))
-        pre = re.sub(r'\b(static|inline|extern|__inline__?|const)\b', '',
-                     fdef['prefix'])
-        is_void = bool(re.search(r'\bvoid\b', pre)) and '*' not in pre
-        call = ("    {}();\n    return 0;" if is_void
-                else "    return {}();").format(entry)
-        driver = ("/* ===== auto-generated driver: calls {0}() ===== */\n"
-                  "int main(void) {{\n{1}\n}}\n").format(entry, call)
+        driver, dwarns = build_driver(entry, fdef, mtext)
+        for w in dwarns:
+            ctx.warn(w)
 
     if not args.no_rename:
         rename_statics(ctx.units, args.rename_all_static,

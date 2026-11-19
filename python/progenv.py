@@ -98,7 +98,7 @@ def http_open(url, data=None, headers=None, max_redir=8):
         for k, v in (headers or {}).items():
             req.add_header(k, v)
         if is_post:
-            req.data = B(data)
+            req.data = data if isinstance(data, bytes) else data.encode("utf-8")
         try:
             r = opener.open(req, timeout=25)
         except ur.HTTPError as e:
@@ -506,7 +506,7 @@ def call_action(role, page_url, args=None, raw=None, ctype=None):
             raise RuntimeError("no server action id for '%s'" % role)
         hdr = {"Next-Action": aid, "Accept": "text/x-component", "Origin": BASE,
                "Referer": page_url, "Content-Type": ctype or "text/plain;charset=UTF-8"}
-        body = raw if raw is not None else B(json.dumps(args))
+        body = raw if raw is not None else json.dumps(args).encode("utf-8")
         u, code, text = http(page_url, data=body, headers=hdr)
         if urlparse(u).path.rstrip("/").endswith("/login"):
             cookies.pop("access_token", None)

@@ -519,6 +519,28 @@ def call_action(role, page_url, args=None, raw=None, ctype=None):
     raise RuntimeError("server action '%s' not found or session lost" % role)
 
 
+def multipart(parts):
+    """Build a multipart/form-data body as bytes (UTF-8 safe, no implicit ascii decoding)."""
+    import uuid
+    boundary = "----progenv" + uuid.uuid4().hex
+    def b(x):
+        return x if isinstance(x, bytes) else x.encode("utf-8")
+    out = []
+    for p in parts:
+        out.append(b("--" + boundary + "\r\n"))
+        if p[0] == "field":
+            _, name, value = p
+            out.append(b('Content-Disposition: form-data; name="%s"\r\n\r\n' % name))
+            out.append(b(value))
+        else:
+            _, name, fname, mime, content = p
+            out.append(b('Content-Disposition: form-data; name="%s"; filename="%s"\r\n' % (name, fname)))
+            out.append(b("Content-Type: %s\r\n\r\n" % mime))
+            out.append(b(content))
+        out.append(b("\r\n"))
+    out.append(b("--" + boundary + "--\r\n"))
+    return b"".join(out), "multipart/form-data; boundary=" + boundary
+
 TASK_RE = re.compile(r"^(https?://[^/]+)((?:/[a-z]{2})?)(/courses/\d+(?:/groups/\d+)?/topics/\d+/tasks/\d+)")
 
 def parse_task(url):

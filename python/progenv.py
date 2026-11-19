@@ -519,7 +519,7 @@ def call_action(role, page_url, args=None, raw=None, ctype=None):
     raise RuntimeError("server action '%s' not found or session lost" % role)
 
 
-TASK_RE = re.compile(r"^(https?://[^/]+)((?:/[a-z]{2})?)(/courses/\d+/groups/\d+/topics/\d+/tasks/\d+)")
+TASK_RE = re.compile(r"^(https?://[^/]+)((?:/[a-z]{2})?)(/courses/\d+(?:/groups/\d+)?/topics/\d+/tasks/\d+)")
 
 def parse_task(url):
     m = TASK_RE.match(url or "")
